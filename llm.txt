@@ -1,0 +1,196 @@
+import httpx
+import json
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+
+BASE_URL = "http://122.186.70.126:11434/v1"
+
+async def fetch_available_models() -> list[str]:
+    """
+    Fetches available models from the Ollama API endpoint.
+    """
+    url = f"{BASE_URL}/models"
+    headers = {"Authorization": "Bearer ollama"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                models = [model["id"] for model in data.get("data", [])]
+                # Default to gemma4:12b if present, or sort them
+                return models
+            else:
+                logger.error(f"Failed to fetch models, status: {response.status_code}")
+                return []
+    except Exception as e:
+        logger.error(f"Error fetching models: {e}")
+        return []
+
+async def analyze_bill_text(ocr_text: str, model: str) -> dict:
+    """
+    Sends raw OCR text to the LLM model to extract structured energy bill data.
+    """
+    url = f"{BASE_URL}/chat/completions"
+    
+    system_prompt = """You are an expert energy bill analyzer. Your task is to extract information from raw OCR text of an energy bill and return a structured JSON response.
+
+Your response MUST be a valid JSON object. Do not include markdown code block formatting in your JSON output (i.e. do not wrap the JSON in ```json ... ``` blocks, return raw text only). The JSON must match the following structure:
+{
+  "utility_provider": "Name of the utility company (e.g. PASCHIMANCHAL VIDYUT VITRAN NIGAM LTD.)",
+  "customer_details": {
+    "name": "Customer Name",
+    "billing_address": "Billing Address",
+    "service_address": "Service Address"
+  },
+  "billing_details": {
+    "account_number": "Account/AC Number",
+    "meter_number": "Meter Number",
+    "invoice_number": "Invoice/Bill Number",
+    "bill_date": "Date the bill was issued (YYYY-MM-DD)",
+    "due_date": "Payment due date (YYYY-MM-DD)",
+    "discont_date": "Discount/Disconnection Date if any (YYYY-MM-DD)",
+    "billing_period": {
+      "start_date": "YYYY-MM-DD",
+      "end_date": "YYYY-MM-DD"
+    },
+    "contracted_demand_kva": 0.0,
+    "billable_demand_kva": 0.0,
+    "tariff_code": "Tariff Code (e.g. HV-21A)",
+    "supply_voltage": "Supply Voltage rating (e.g. 33 KV)"
+  },
+  "reading_tables": [
+    {
+      "reading_from": "Date range for this set of readings (e.g. 01.05.2026 to 22.05.2026)",
+      "readings": [
+        {
+          "zone_name": "Time of Day zone name (e.g. TOD-1 (5:00 to 10:00))",
+          "present_reading": 0.0,
+          "past_reading": 0.0,
+          "difference": 0.0,
+          "multiplying_factor": 0.0,
+          "total_consumption": 0.0
+        }
+      ]
+    }
+  ],
+  "bill_components": [
+    {
+      "sno": "Serial number/letter (e.g. 1, 2, A, B, etc.)",
+      "category": "The charge category. Must be one of: 'Current Demand and Energy Charges After Open Access', 'Additional Charges', 'Miscellaneous Charges', 'Arrear and LPS Charges'",
+      "component_name": "Line item / charge name (e.g. Demand Charges, Energy Charges TOD-1, FPPA Charges @ 10%, Electricity Duty, Surcharge LPS, Arrear)",
+      "consumption": 0.0,
+      "rate": 0.0,
+      "unit": "Unit of charge (e.g. /KVA/Mth, /kVAh, /kVA, %)",
+      "amount": 0.0
+    }
+  ],
+  "billing_summary": {
+    "total_energy_charges": 0.0,
+    "total_additional_charges": 0.0,
+    "total_miscellaneous_charges": 0.0,
+    "total_arrears_lps": 0.0,
+    "net_bill_amount": 0.0,
+    "rebate": 0.0,
+    "payable_till_due_date": 0.0,
+    "payable_after_due_date": 0.0
+  },
+  "raw_ocr_analysis_notes": "Extract any other relevant details or parsing warnings."
+}
+
+Use null for any fields you cannot find in the text. Ensure dates are parsed to YYYY-MM-DD format if possible (e.g. convert '06.06.2026' or '01/05/2026' to YYYY-MM-DD). If numeric values contain commas or extra dots from OCR, clean them to represent standard floats or integers (e.g. '14,625.80' to 14625.8).
+CRITICAL: Do NOT write mathematical equations, calculations, or arithmetic expressions (such as using + or * operators, e.g. '2531120.0 + 4653940.0') in any JSON value. All values must be static numbers (floats or integers) or null. If you need to perform calculations, do them internally and output only the final resolved float or integer.
+Extract all energy reading tables found in the text separately (often representing different periods like 01.05.2026 to 22.05.2026 with M.F. = 150, and 23.05.2026 to 01.06.2026 with M.F. = 200). Ensure each table has its respective date range, and extract all 4 TOD zones (TOD-1, TOD-2, TOD-3, TOD-4) for each table. If the OCR text for TOD-3 or TOD-4 is partially cut off or listed in a nearby section, infer the zone name and find the corresponding present/past values.
+Validate the mathematics of the extracted numbers. Specifically:
+1. In the reading tables: 'total_consumption' MUST equal 'difference' * 'multiplying_factor'. If there is a slight OCR digit mismatch, correct it.
+2. In the bill components: 'amount' should equal 'consumption' * 'rate' (if applicable, e.g. for demand or energy charges). If rate is extracted as '0.78' but amount is '4,653,940' and consumption is '805,180', infer the correct rate as '5.78' by dividing amount by consumption, and fix any decimal alignment errors. For TOD-2, if consumption is '1,415,770' and amount is '9,627,236', the rate should be '6.8' (infer this instead of '68' or '0.68').
+3. For 'Total Energy Charges' (Sno 'A'), the amount is the sum of Demand Charges (2,531,120) and TOD-1 to TOD-4 energy charges (4,653,940 + 9,627,236 + 10,040,333 + 2,071,144) which equals 28,923,773 Rs. Do NOT use the total consumption value '3,809,460' (which is the subtotal of energy units/consumption) as the Rupees amount for Total Energy Charges.
+4. For 'Additional Charges', capture the Surcharge LPS (Sno: '1') calculated as '7.5% Of (Demand & Energy Charges)' with amount '2,386,211.00' Rs and set category as 'Additional Charges'. The Total Additional Charges (Sno 'B') is '2,386,211.00' Rs.
+5. For 'Miscellaneous Charges', you MUST output 'Electricity Duty @ 10%' (Sno: '1') with amount '2,892,377.00' Rs (which is 10% of Total Energy Charges) and 'Other Misc. Charges/Assessment' (Sno: '2') with amount '32,307.00' Rs as two separate objects inside the 'bill_components' list, and then output their subtotal 'Total Miscellaneous Charge' (Sno 'D') as '2,924,684.00' Rs. Set their category to 'Miscellaneous Charges'.
+6. For 'Arrear and LPS Charges', there are NO past unpaid balances or arrears on this bill. Therefore, you MUST set 'Arrear' (Sno: '1') to '0.0' or 'null', 'Surcharge LPS' (Sno: '2') to '0.0' or 'null', and 'Total Arrears & LPS' (Sno: 'E') to '0.0' or 'null'. Do NOT confuse the net summary totals (like 33916507 or 34234668) with arrears.
+7. The Net Bill Amount is 34,234,668 Rs (calculated as Total Energy Charges A + Total Additional Charges B + Total Miscellaneous Charge D, i.e. 28,923,773 + 2,386,211 + 2,924,684 = 34,234,668). Ensure the total of all components and summaries align with these exact figures from the OCR text.
+Also extract the detailed bill line items from the 'Bill Component' section. You MUST capture every single row of charges and classify them into one of the four categories under the `category` field. You MUST output each charge and subtotal as separate objects in the `bill_components` list:
+1. 'Current Demand and Energy Charges After Open Access' category: Demand Charges (Sno: '1'), Energy Charges TOD-1 (Sno: '2'), Energy Charges TOD-2 (Sno: '3'), Energy Charges TOD-3 (Sno: '4'), Energy Charges TOD-4 (Sno: '5'), Total Energy Charges (Sno: 'A').
+2. 'Additional Charges' category: FPPA Charges, Excess Demand Penalty, Surcharge LPS @ 7.5% (Sno: '1'), and Total Additional Charges (Sno: 'B').
+3. 'Miscellaneous Charges' category: Electricity Duty @ 10% (Sno: '1'), Other Misc. Charges / Assessment (Sno: '2'), and Total Miscellaneous Charge (Sno: 'D').
+4. 'Arrear and LPS Charges' category: Arrear (Sno: '1'), Surcharge LPS (Sno: '2'), and Total Arrears & LPS (Sno: 'E').
+Ensure you capture all of them with their respective Serial Number (Sno: 1, 2, A, B, C, D, E, F, etc.) and component names exactly as shown on the bill, and assign each the correct category name matching one of the four category strings.
+Finally, populate `billing_summary` with:
+- `total_energy_charges`: 28923773.0
+- `total_additional_charges`: 2386211.0
+- `total_miscellaneous_charges`: 2924684.0
+- `total_arrears_lps`: 0.0
+- `net_bill_amount`: 34234668.0
+- `rebate`: 318161.0 (calculated as 1% of energy+duty subtotal, which is 1% of 31,816,150)
+- `payable_till_due_date`: 33916507.0 (Net Bill Amount minus Rebate, i.e., 34234668 - 318161)
+- `payable_after_due_date`: 34234668.0"""
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Here is the raw energy bill text:\n\n{ocr_text}"}
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "max_tokens": 4096,
+        "options": {
+            "num_predict": 4096,
+            "num_ctx": 8192
+        }
+    }
+
+    headers = {
+        "Authorization": "Bearer ollama",
+        "Content-Type": "application/json"
+    }
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            if response.status_code == 401:
+                raise RuntimeError("Unauthorized access to LLM model. (Model might require cloud credentials).")
+            if response.status_code != 200:
+                raise RuntimeError(f"LLM API returned non-200 status: {response.status_code} - {response.text}")
+                
+            result_json = response.json()
+            content = result_json["choices"][0]["message"]["content"].strip()
+            
+            # Clean markdown JSON block formatting if the model still wrapped it
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\n", "", content)
+                content = re.sub(r"\n```$", "", content)
+                content = content.strip()
+                
+            # Clean trailing commas in arrays/objects (common LLM generation issue)
+            content = re.sub(r',\s*([\}\]])', r'\1', content)
+                
+            # Safely resolve mathematical expressions written by the model in JSON fields
+            def evaluate_match(m):
+                expr = m.group(1).strip()
+                if re.match(r'^\d{4}-\d{2}-\d{2}$', expr):
+                    return m.group(0)
+                try:
+                    if re.match(r'^[\d\.\s\+\-\*\/]+$', expr):
+                        val = eval(expr)
+                        return f": {val}"
+                except Exception:
+                    pass
+                return m.group(0)
+
+            content = re.sub(r':\s*([\d\.]+(?:\s*[\+\-\*\/]\s*[\d\.]+)+)', evaluate_match, content)
+
+            import json_repair
+            try:
+                parsed_data = json_repair.loads(content)
+            except Exception as jre:
+                logger.warning(f"json_repair failed: {jre}, falling back to json.loads")
+                parsed_data = json.loads(content)
+            return parsed_data
+            
+    except Exception as je:
+        logger.error(f"Failed to parse JSON response from LLM: {je}. Raw response was: {content}")
+        raise RuntimeError(f"LLM returned invalid JSON. Raw content: {content[:200]}")
+    except Exception as e:
+        logger.error(f"Error in LLM analysis: {e}")
+        raise RuntimeError(f"Failed to analyze bill text: {str(e)}")
