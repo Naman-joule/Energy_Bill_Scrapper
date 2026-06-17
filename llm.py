@@ -17,6 +17,15 @@ CAT_ARREAR = "Arrear and LPS Charges"
 # Models on the server that can accept images (vision capability).
 VISION_MODELS = {"gemma4:12b", "gemma4:e4b"}
 
+# Standard tariff percentages for THIS bill format (PVVNL/UPPCL HV-2). Used ONLY
+# as a fallback to compute FPPA (% of energy charges A) and Electricity Duty
+# (% of the Demand+Energy subtotal C) when the percentage cannot be read off the
+# bill. The amount is still derived from THIS bill's own A/C — not a fixed value
+# — and the result is cross-checked against the printed net (flagged if it
+# disagrees). Set to None to disable the fallback and rely only on the read %.
+FPPA_PCT_DEFAULT = 10.0
+DUTY_PCT_DEFAULT = 7.5
+
 
 async def fetch_available_models() -> list[str]:
     """
@@ -234,7 +243,12 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
     fppa_line = next((c for c in add_lines
                       if any(k in str(c.get("component_name") or "").lower() for k in ("fppa", "fuel"))), None)
     if fppa_line is not None and B > 0:
-        pct = _pct_in(fppa_line.get("component_name"), fppa_line.get("unit"))
+        fppa_pct_ocr = None
+        if ocr_text:
+            m = re.search(r"@\s*(\d+(?:\.\d+)?)\s*%", ocr_text)
+            if m:
+                fppa_pct_ocr = float(m.group(1))
+        pct = _pct_in(fppa_line.get("component_name"), fppa_line.get("unit")) or fppa_pct_ocr or FPPA_PCT_DEFAULT
         if pct:
             # Bill amounts are whole rupees; round the derived FPPA to an integer
             # and make the remaining additional line the exact residual of B.
@@ -243,6 +257,51 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
             other_add = [c for c in add_lines if c is not fppa_line]
             if len(other_add) == 1:
                 other_add[0]["amount"] = float(round(B - fppa_amt))
+
+    # --- 3a-2. Electricity Duty = stated % of C. The duty line records its base
+    # as e.g. '7.5% Of (Demand & Energy Charges)'; computing from that % and the
+    # validated C recovers the exact amount even when the printed figure is
+    # garbled (this is more reliable than reading the large amount). ---
+    misc_lines = [c for c in components
+                  if c.get("category") == CAT_MISC
+                  and not _is_subtotal(c.get("sno"), c.get("component_name"))]
+    # Electricity Duty % comes from the line fields or, as a fallback, the OCR
+    # text (the bill prints 'X% Of (Demand & Energy Charges)').
+    duty_pct_ocr = None
+    if ocr_text:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*of", ocr_text, re.IGNORECASE)
+        if m:
+            duty_pct_ocr = float(m.group(1))
+    duty_recomputed = False
+    for c in misc_lines:
+        if "duty" in str(c.get("component_name") or "").lower():
+            pct = _pct_in(c.get("rate"), c.get("unit"), c.get("component_name")) or duty_pct_ocr or DUTY_PCT_DEFAULT
+            if pct:
+                c["amount"] = float(round(C * pct / 100.0))
+                duty_recomputed = True
+    if duty_recomputed:
+        D, hasD = section_sum(CAT_MISC)
+
+    # --- 3a-3. Energy-line back-out: trust the validated Total Energy Charges A.
+    # If the energy lines don't sum to A and exactly ONE line's amount is absent
+    # from the OCR text (i.e. it was misread), correct it to A - sum(others) and
+    # re-derive its rate. Recovers a single mis-read TOD amount exactly. ---
+    energy_lines = [c for c in components
+                    if c.get("category") == CAT_ENERGY
+                    and not _is_subtotal(c.get("sno"), c.get("component_name"))]
+    if A > 0 and energy_lines and ocr_numbers:
+        esum = round(sum((_to_number(c.get("amount")) or 0) for c in energy_lines), 2)
+        if abs(esum - A) > max(2.0, A * 0.001):
+            suspects = [c for c in energy_lines
+                        if str(int(_to_number(c.get("amount")) or 0)) not in ocr_numbers]
+            if len(suspects) == 1:
+                others = sum((_to_number(c.get("amount")) or 0)
+                             for c in energy_lines if c is not suspects[0])
+                fixed = float(round(A - others))
+                suspects[0]["amount"] = fixed
+                cons = _to_number(suspects[0].get("consumption"))
+                if cons and cons > 0:
+                    suspects[0]["rate"] = round(fixed / cons, 4)
 
     # Capture printed totals BEFORE we overwrite any subtotal rows.
     printed_C = printed_subtotal("C")
@@ -269,7 +328,9 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
     net_recovered = False
     ab_ok = (printed_C is None) or abs(printed_C - C) <= max(2.0, abs(printed_C) * 0.01)
     e_ok = (printed_E_row is None) or abs(printed_E_row - E) <= max(2.0, abs(printed_E_row) * 0.05)
-    if printed_grand_total and printed_grand_total > 0 and ab_ok and e_ok:
+    # Skip the net back-out when Duty was already computed from its stated
+    # percentage (that is more reliable than a possibly-misread printed net).
+    if printed_grand_total and printed_grand_total > 0 and ab_ok and e_ok and not duty_recomputed:
         implied_D = round(printed_grand_total - C - E, 2)
         if implied_D >= 0 and abs(implied_D - D) > max(2.0, printed_grand_total * 0.001):
             # Absorb the discrepancy into the Miscellaneous (Electricity Duty) line.
@@ -288,10 +349,19 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
 
     # --- 4. Write reconciled subtotals back onto the subtotal rows. ---
     subtotal_values = {"A": A, "B": B, "C": C, "D": D, "E": E, "F": net}
+    # A-row "consumption" = sum of the TOD energy units only (exclude the Demand
+    # Charges line, whose 'consumption' is the KVA demand, not energy units).
+    energy_cons_sum = round(sum(
+        (_to_number(c.get("consumption")) or 0) for c in energy_lines
+        if "demand" not in str(c.get("component_name") or "").lower()), 2)
     for c in components:
         sno_s = str(c.get("sno") or "").strip().upper().rstrip(".")
         if sno_s in subtotal_values:
             c["amount"] = subtotal_values[sno_s]
+            # The Total Energy Charges (A) row's "consumption" cell is the sum of
+            # the TOD energy units; recompute it from the line items.
+            if sno_s == "A" and energy_cons_sum > 0:
+                c["consumption"] = energy_cons_sum
 
     # --- 5. Rebate + payable figures. ---
     summary = data.get("billing_summary")
@@ -401,6 +471,21 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
         note += " WARNINGS: " + " ".join(warnings)
     existing = data.get("raw_ocr_analysis_notes")
     data["raw_ocr_analysis_notes"] = (f"{existing} | " if existing else "") + note
+
+    # --- 8. Round monetary amounts to whole rupees (this bill format has no
+    # paise), removing float artifacts like 4653940.4 from rate*consumption. ---
+    def _round_money(v):
+        n = _to_number(v)
+        return float(round(n)) if n is not None else v
+
+    for c in components:
+        if c.get("amount") is not None:
+            c["amount"] = _round_money(c.get("amount"))
+    for k in ("total_energy_charges", "total_additional_charges", "total_miscellaneous_charges",
+              "total_arrears_lps", "net_bill_amount", "rebate",
+              "payable_till_due_date", "payable_after_due_date"):
+        if summary.get(k) is not None:
+            summary[k] = _round_money(summary.get(k))
 
     return data
 
