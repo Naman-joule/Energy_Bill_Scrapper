@@ -23,7 +23,7 @@ VISION_MODELS = {"gemma4:12b", "gemma4:e4b"}
 # bill. The amount is still derived from THIS bill's own A/C — not a fixed value
 # — and the result is cross-checked against the printed net (flagged if it
 # disagrees). Set to None to disable the fallback and rely only on the read %.
-FPPA_PCT_DEFAULT = 10.0
+FPPA_PCT_DEFAULT = None
 DUTY_PCT_DEFAULT = 7.5
 
 
@@ -71,7 +71,9 @@ def _is_subtotal(sno, name):
     if sno_s in {"A", "B", "C", "D", "E", "F"}:
         return True
     name_l = str(name or "").lower()
-    return any(k in name_l for k in ("total", "rebate", "net bill"))
+    if "adjustment" in name_l or "adjust" in name_l or "due date" in name_l:
+        return False
+    return any(k in name_l for k in ("total", "net bill"))
 
 
 # Generic keyword -> category map for common Indian electricity-bill line items.
@@ -153,6 +155,23 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
 
     components = data.get("bill_components") or []
 
+    # --- 1a. Deduplicate UPPCL general "Misc. Charges" vs detailed breakdown items ---
+    has_detailed_misc = any(
+        any(k in str(c.get("component_name") or "").lower() for k in ("fppa", "surcharge", "rebate adjustment", "due date rebate"))
+        for c in components if not _is_subtotal(c.get("sno"), c.get("component_name"))
+    )
+    if has_detailed_misc:
+        new_components = []
+        for c in components:
+            name_l = str(c.get("component_name") or "").lower()
+            sno_s = str(c.get("sno") or "").lower().strip()
+            # If it is the general "Misc. Charges" or "Other Misc Charges" row, and we have details, filter it out
+            if (sno_s == "misc" or not sno_s) and any(k in name_l for k in ("misc. charges", "misc charges", "other misc charges", "other miscellaneous charges")):
+                continue
+            new_components.append(c)
+        components = new_components
+        data["bill_components"] = components
+
     # --- 1b. Correct the LLM's section assignment by generic charge-name keywords. ---
     for c in components:
         if _is_subtotal(c.get("sno"), c.get("component_name")):
@@ -187,6 +206,16 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
                 snapped = _snap_to_ocr(v, ocr_numbers)
                 if snapped is not None and snapped != v:
                     c[fld] = snapped
+
+    # --- 2c. Force credit components to be negative if they were transcribed as positive ---
+    for c in components:
+        if _is_subtotal(c.get("sno"), c.get("component_name")):
+            continue
+        name_l = str(c.get("component_name") or "").lower()
+        if any(k in name_l for k in ("rebate adjustment", "due date rebate", "interest on security", "interest on advance payment", "compensation amt")):
+            amt = _to_number(c.get("amount"))
+            if amt is not None and amt > 0:
+                c["amount"] = -amt
 
     # --- 3. Section subtotals: prefer the PRINTED subtotal row when present
     # (extraction is now accurate enough that the printed A/B/D/E are reliable),
@@ -231,6 +260,18 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
     B = choose("B", sumB, hasB)
     D = choose("D", sumD, hasD)
     E = choose("E", sumE, hasE)
+    if E == 0.0 and not hasE:
+        ocr_arrear = None
+        if ocr_text:
+            m = re.search(r"(?:Arrear\s*Amount|बकाया\s*धनरािश)[^\d]*(\d+(?:\.\d+)?)", ocr_text, re.IGNORECASE)
+            if m:
+                ocr_arrear = float(m.group(1))
+        if ocr_arrear is not None:
+            E = ocr_arrear
+        else:
+            summary_obj = data.get("billing_summary")
+            if isinstance(summary_obj, dict):
+                E = _to_number(summary_obj.get("total_arrears_lps")) or 0.0
     C = round(A + B, 2)
 
     # --- 3a. Fix the FPPA vs excess-demand-penalty split within Additional.
@@ -313,6 +354,11 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
                 printed_grand_total = _to_number(c.get("amount"))
                 if printed_grand_total:
                     break
+    if printed_grand_total is None and ocr_text:
+        # Match 'Payable Amount 11926601' or 'देय धनरािश/ Payable Amount 11926601'
+        m = re.search(r"(?:Payable\s*Amount|देय\s*धनरािश)[^\d]*(\d+(?:\.\d+)?)", ocr_text, re.IGNORECASE)
+        if m:
+            printed_grand_total = float(m.group(1))
     summary_obj = data.get("billing_summary")
     if isinstance(summary_obj, dict) and printed_grand_total is None:
         printed_grand_total = _to_number(summary_obj.get("net_bill_amount"))
@@ -325,6 +371,9 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
     # the Miscellaneous section (Electricity Duty is the usual culprit), so we
     # back it out EXACTLY: D = printed_net - C - E. No hard-coded amounts. ---
     net = round(A + B + D + E, 2)
+    # Snap computed net to printed net if they are within 2.0 (handles rounding differences)
+    if printed_grand_total and printed_grand_total > 0 and abs(net - printed_grand_total) <= 2.0:
+        net = printed_grand_total
     net_recovered = False
     ab_ok = (printed_C is None) or abs(printed_C - C) <= max(2.0, abs(printed_C) * 0.01)
     e_ok = (printed_E_row is None) or abs(printed_E_row - E) <= max(2.0, abs(printed_E_row) * 0.05)
@@ -346,6 +395,8 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
             D = implied_D
             net_recovered = True
     net = round(A + B + D + E, 2)
+    if printed_grand_total and printed_grand_total > 0 and abs(net - printed_grand_total) <= 2.0:
+        net = printed_grand_total
 
     # --- 4. Write reconciled subtotals back onto the subtotal rows. ---
     subtotal_values = {"A": A, "B": B, "C": C, "D": D, "E": E, "F": net}
@@ -371,14 +422,42 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
 
     printed_net_raw = summary.get("net_bill_amount")
 
-    rebate = _to_number(summary.get("rebate"))
+    rebate = None
+    if ocr_text:
+        # Match 'Due Date Rebate ( ) 110945.13' or 'Due Date Rebate 110945.13'
+        m = re.search(r"Due\s*Date\s*Rebate\s*(?:\([^)]*\))?\s*(\d+(?:\.\d+)?)", ocr_text, re.IGNORECASE)
+        if m:
+            rebate = float(m.group(1))
+
     if rebate is None:
-        for c in components:
-            if "rebate" in str(c.get("component_name") or "").lower():
-                rebate = _to_number(c.get("amount"))
-                break
+        # If not found in OCR, fall back to check if LLM extracted a plausible rebate in summary or components
+        llm_rebate = _to_number(summary.get("rebate"))
+        if llm_rebate is not None and llm_rebate > 0 and llm_rebate != abs(E):
+            rebate = llm_rebate
+        else:
+            for c in components:
+                if "rebate" in str(c.get("component_name") or "").lower():
+                    val = _to_number(c.get("amount"))
+                    if val is not None and val > 0 and val != abs(E):
+                        rebate = val
+                        break
+
     if rebate is None:
-        rebate = 0.0
+        has_detailed_misc = any(
+            any(k in str(c.get("component_name") or "").lower() for k in ("fppa", "due date rebate", "rebate adjustment"))
+            for c in components if not _is_subtotal(c.get("sno"), c.get("component_name"))
+        )
+        if has_detailed_misc:
+            rebate = round(C * 0.01)
+        else:
+            duty_amt = 0.0
+            for c in components:
+                if "duty" in str(c.get("component_name") or "").lower():
+                    duty_amt = _to_number(c.get("amount")) or 0.0
+                    break
+            if not duty_amt:
+                duty_amt = round(A * 0.10)
+            rebate = round((A + duty_amt) * 0.01)
 
     payable_after = net
     payable_till = round(net - rebate, 2)
@@ -394,7 +473,7 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
     summary["payable_after_due_date"] = payable_after
 
     # --- 7. Confidence check vs. printed net. ---
-    printed_net = _to_number(printed_net_raw) or printed_grand_total
+    printed_net = printed_grand_total or _to_number(printed_net_raw)
 
     confidence = "high"
     warnings = []
@@ -499,7 +578,7 @@ SYSTEM_PROMPT = """You are an expert energy-bill data extractor. You receive an 
 IMPORTANT OUTPUT DISCIPLINE: respond with ONLY the JSON object — no explanation, no reasoning, no markdown fences. Your entire reply is the JSON.
 
 When BOTH an image and OCR text are provided:
-- The OCR TEXT is AUTHORITATIVE for every numeric digit and amount. Copy amounts, consumptions, rates and readings VERBATIM from the OCR text — do not shorten, round, or drop digits. For example, if the OCR text shows an amount of 4653940, output 4653940 (NOT 465394).
+- The OCR TEXT is AUTHORITATIVE for every numeric digit and amount. Copy amounts, consumptions, rates and readings VERBATIM from the OCR text — do not shorten, round, or drop digits.
 - Use the IMAGE to understand the table LAYOUT and WHICH SECTION each charge belongs to, and to spot rows the OCR may have missed.
 - If a number is legible in the OCR text, always prefer that exact figure over what you think you see in the image.
 
@@ -537,12 +616,21 @@ The JSON MUST match this structure:
 Rules:
 - Use null for fields not present. Convert dates to YYYY-MM-DD. Clean numbers (strip commas/currency) to plain numbers. Never write arithmetic expressions in any value.
 - Extract every reading-period table separately with its date range and every TOD zone present.
-- Capture EVERY row of the 'Bill Component' table: each charge line AND each subtotal row (Sno A, B, C, D, E, F, and any Rebate row), with sno, component_name, consumption, rate, unit, amount as printed.
-- Classify each row by the SECTION HEADER it sits under (a row inherits the most recent header above it). The four categories, in printed order:
-  * 'Current Demand and Energy Charges After Open Access' — Demand Charges + Energy Charges TOD-1..n; subtotal 'Total Energy Charges' (A).
-  * 'Additional Charges' — excess-demand penalty + FPPA/fuel surcharge; subtotals 'Total Additional Charges' (B) and 'Total (A+B)' (C).
-  * 'Miscellaneous Charges' — Other Misc.Charges/Assessment + Electricity Duty; subtotal 'Total Miscellaneous Charge' (D).
-  * 'Arrear and LPS Charges' — Arrear + Surcharge LPS; subtotal 'Total Arrears & LPS' (E).
+- Capture EVERY row of the 'Bill Component' table: each charge line AND each subtotal/total row (Sno A, B, C, D, E, F, etc. when printed).
+- Classify each row into one of the four categories under the `category` field:
+  * 'Current Demand and Energy Charges After Open Access': Fixed/Demand Charges, Energy Charges TOD-1..n, and Total Energy Charges (A).
+  * 'Additional Charges': FPPA/fuel surcharge, Excess Demand Penalty, and Total Additional Charges (B) / Total (A+B) (C).
+  * 'Miscellaneous Charges': Electricity Duty, Due date rebate adjustment, other misc. charges, and Total Miscellaneous Charge (D).
+  * 'Arrear and LPS Charges': Arrears, Surcharge LPS, and Total Arrears & LPS (E).
+- Do NOT duplicate any row. If FPPA Surcharge, Electricity Duty, or Due date rebate adjustment are listed in a separate breakdown table (like 'Details of Miscellaneous Charges'), extract them once under their correct categories and do NOT duplicate them.
+- If a subtotal or total row is not explicitly printed on the bill, do NOT synthesize it. Just extract the printed rows.
+- Reconcile names and categories:
+  - Fixed/Demand Charges (िफकसड/मांग पभार) -> 'Current Demand and Energy Charges After Open Access'
+  - TOD Energy Charges / Time of Day Charges -> 'Current Demand and Energy Charges After Open Access'
+  - FPPA Surcharge (ईधन और िबजली अिधभार) -> 'Additional Charges'
+  - Electricity Duty (िवदुत कर) -> 'Miscellaneous Charges'
+  - Due date rebate adjustment (देय ितिथ छूट समायोजन) -> 'Miscellaneous Charges'
+  - Arrear Amount (बकाया धनरािश) -> 'Arrear and LPS Charges'
 - Do NOT move a line into a section it is not printed under, and do NOT force a printed amount to zero (use 0 only when the bill shows 0/blank).
 
 FORMAT EXAMPLE (FICTITIOUS numbers — show mapping only, NEVER copy them):

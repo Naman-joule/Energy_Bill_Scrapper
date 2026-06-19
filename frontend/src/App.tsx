@@ -16,7 +16,9 @@ import {
   Clock, 
   File as FileIcon,
   Download,
-  Upload
+  Upload,
+  Calculator,
+  CheckCircle2
 } from 'lucide-react';
 import './App.css';
 
@@ -81,6 +83,17 @@ interface BillingSummary {
   payable_after_due_date: number | null;
 }
 
+interface CalculatedSummary {
+  total_energy_charges: number;
+  total_additional_charges: number;
+  total_miscellaneous_charges: number;
+  total_arrears_lps: number;
+  net_bill_amount: number;
+  rebate: number;
+  payable_till_due_date: number;
+  payable_after_due_date: number;
+}
+
 interface BillData {
   utility_provider: string | null;
   customer_details: CustomerDetails | null;
@@ -123,6 +136,8 @@ function App() {
   const [editableData, setEditableData] = useState<BillData | null>(null);
   const [activeTab, setActiveTab] = useState<'image' | 'ocr' | 'json'>('image');
   const [viewMode, setViewMode] = useState<'statement' | 'metrics'>('statement');
+  const [showVerifyModal, setShowVerifyModal] = useState<boolean>(false);
+  const [calculatedSummary, setCalculatedSummary] = useState<CalculatedSummary | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const csvInputRef = useRef<HTMLInputElement>(null);
@@ -451,6 +466,175 @@ function App() {
       ...editableData,
       bill_components: newComponents
     });
+  };
+
+  const performBillCalculation = () => {
+    if (!editableData) return;
+
+    // 1. Recalculate Reading Tables (Present - Past = Difference, Difference * MF = Total KWH)
+    const updatedReadingTables = editableData.reading_tables ? editableData.reading_tables.map(table => {
+      if (!table.readings) return table;
+      const updatedReadings = table.readings.map(reading => {
+        let diff = reading.difference;
+        if (reading.present_reading !== null && reading.past_reading !== null) {
+          diff = Number((reading.present_reading - reading.past_reading).toFixed(3));
+        }
+        let total = reading.total_consumption;
+        if (diff !== null && reading.multiplying_factor !== null) {
+          total = Number((diff * reading.multiplying_factor).toFixed(2));
+        }
+        return {
+          ...reading,
+          difference: diff,
+          total_consumption: total
+        };
+      });
+      return { ...table, readings: updatedReadings };
+    }) : null;
+
+    // Helper to identify subtotal rows
+    const isSubtotalRow = (comp: BillComponentItem) => {
+      const sno = (comp.sno || '').toUpperCase().trim();
+      const name = (comp.component_name || '').toUpperCase().trim();
+      return ['A', 'B', 'C', 'D', 'E', 'F', 'TOTAL'].includes(sno) || name.includes('TOTAL') || name.includes('SUBTOTAL');
+    };
+
+    // 2. Recalculate Bill Component Amounts (Consumption * rate = Amount)
+    const recalculatedComponents = editableData.bill_components ? editableData.bill_components.map(comp => {
+      if (isSubtotalRow(comp)) return comp;
+      let amt = comp.amount;
+      if (comp.consumption !== null && comp.rate !== null) {
+        amt = Number((comp.consumption * comp.rate).toFixed(2));
+      }
+      return { ...comp, amount: amt };
+    }) : [];
+
+    // 3. Compute Category Sums
+    let energy = 0;
+    let additional = 0;
+    let misc = 0;
+    let arrears = 0;
+    let dutyAmount = 0;
+
+    recalculatedComponents.forEach(comp => {
+      if (isSubtotalRow(comp)) return;
+
+      const amt = comp.amount || 0;
+      const cat = (comp.category || '').toLowerCase().trim();
+
+      if (cat === 'current demand and energy charges after open access' || cat.includes('demand') || cat.includes('energy')) {
+        energy += amt;
+      } else if (cat === 'additional charges' || cat.includes('additional')) {
+        additional += amt;
+      } else if (cat === 'miscellaneous charges' || cat.includes('misc') || cat.includes('miscellaneous')) {
+        misc += amt;
+        // Locate duty amount under miscellaneous charges
+        const name = (comp.component_name || '').toLowerCase();
+        if (name.includes('duty') || name.includes('electricity duty')) {
+          dutyAmount = amt;
+        }
+      } else if (cat === 'arrear and lps charges' || cat.includes('arrear') || cat.includes('lps')) {
+        arrears += amt;
+      }
+    });
+
+    const finalDuty = dutyAmount || Number((energy * 0.10).toFixed(2));
+
+    // Rebate calculation:
+    // UPPCL (New PDF): 1% of subtotal C (Energy + Additional)
+    // PVVNL (Old Image): 1% of (Energy + Duty)
+    const hasDetailedMisc = recalculatedComponents ? recalculatedComponents.some(comp => {
+      const sno = (comp.sno || '').toUpperCase().trim();
+      const name = (comp.component_name || '').toUpperCase().trim();
+      const isSubtotal = ['A', 'B', 'C', 'D', 'E', 'F', 'TOTAL'].includes(sno) || name.includes('TOTAL') || name.includes('SUBTOTAL');
+      if (isSubtotal) return false;
+      const nameLower = name.toLowerCase();
+      return nameLower.includes('fppa') || nameLower.includes('due date rebate') || nameLower.includes('adjustment');
+    }) : false;
+
+    const rebate = hasDetailedMisc 
+      ? Math.round((energy + additional) * 0.01)
+      : Math.round((energy + finalDuty) * 0.01);
+
+    // Formulas:
+    // Total (A+B) = Total Energy Charges + Total Additional Charges
+    const netA_B = Number((energy + additional).toFixed(2));
+    
+    // Total (A+B+C+D+E) = Total (A+B) + Total Miscellaneous Charge + Total Arrears & LPS
+    const netBill = Number((netA_B + misc + arrears).toFixed(2));
+    
+    const payableTillDue = Number((netBill - rebate).toFixed(2));
+    const payableAfterDue = netBill;
+
+    // 4. Update the subtotal rows in components list to match calculated values
+    const finalComponents = recalculatedComponents.map(comp => {
+      const sno = (comp.sno || '').toUpperCase().trim();
+      const name = (comp.component_name || '').toUpperCase().trim();
+
+      if (sno === 'A' || name.includes('TOTAL ENERGY')) {
+        return { ...comp, amount: Number(energy.toFixed(2)) };
+      }
+      if (sno === 'B' || name.includes('TOTAL ADDITIONAL')) {
+        return { ...comp, amount: Number(additional.toFixed(2)) };
+      }
+      if (sno === 'C' || name.includes('TOTAL (A+B)')) {
+        return { ...comp, amount: netA_B };
+      }
+      if (sno === 'D' || name.includes('TOTAL MISCELLANEOUS')) {
+        return { ...comp, amount: Number(misc.toFixed(2)) };
+      }
+      if (sno === 'E' || name.includes('TOTAL ARREARS')) {
+        return { ...comp, amount: Number(arrears.toFixed(2)) };
+      }
+      if (sno === 'F' || sno === 'TOTAL' || name === 'TOTAL' || name.includes('GRAND TOTAL') || name.includes('NET BILL AMOUNT')) {
+        return { ...comp, amount: netBill };
+      }
+      return comp;
+    });
+
+    const summary: CalculatedSummary = {
+      total_energy_charges: Number(energy.toFixed(2)),
+      total_additional_charges: Number(additional.toFixed(2)),
+      total_miscellaneous_charges: Number(misc.toFixed(2)),
+      total_arrears_lps: Number(arrears.toFixed(2)),
+      net_bill_amount: netBill,
+      rebate: rebate,
+      payable_till_due_date: payableTillDue,
+      payable_after_due_date: payableAfterDue
+    };
+
+    setCalculatedSummary(summary);
+    setShowVerifyModal(true);
+
+    // Apply reading/component row level recalculations immediately to screen
+    setEditableData({
+      ...editableData,
+      reading_tables: updatedReadingTables,
+      bill_components: finalComponents
+    });
+  };
+
+  const applyCalculatedTotals = () => {
+    if (!editableData || !calculatedSummary) return;
+
+    // Apply calculated summary totals to state
+    const newSummary: BillingSummary = {
+      total_energy_charges: calculatedSummary.total_energy_charges,
+      total_additional_charges: calculatedSummary.total_additional_charges,
+      total_miscellaneous_charges: calculatedSummary.total_miscellaneous_charges,
+      total_arrears_lps: calculatedSummary.total_arrears_lps,
+      net_bill_amount: calculatedSummary.net_bill_amount,
+      rebate: calculatedSummary.rebate,
+      payable_till_due_date: calculatedSummary.payable_till_due_date,
+      payable_after_due_date: calculatedSummary.payable_after_due_date
+    };
+
+    setEditableData({
+      ...editableData,
+      billing_summary: newSummary
+    });
+
+    setShowVerifyModal(false);
   };
 
   // --- CSV Export & Import ---
@@ -984,9 +1168,17 @@ function App() {
                     Dashboard Metrics
                   </button>
                   <button 
+                    className="tab-btn btn-calculate-action"
+                    onClick={performBillCalculation}
+                    style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(13, 148, 136, 0.15)', border: '1px solid rgba(13, 148, 136, 0.3)', color: 'var(--accent-hover)', borderRadius: '4px' }}
+                  >
+                    <Calculator size={14} />
+                    Calculate & Match Bill
+                  </button>
+                  <button 
                     className="tab-btn"
                     onClick={exportToCSV}
-                    style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px' }}
+                    style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
                   >
                     <Download size={14} />
                     Export CSV
@@ -1842,6 +2034,189 @@ function App() {
           </section>
         </main>
       </div>
+      {showVerifyModal && calculatedSummary && results?.data?.billing_summary && (
+        <div className="verify-modal-backdrop" onClick={() => setShowVerifyModal(false)}>
+          <div className="verify-modal-content glass-card" onClick={(e) => e.stopPropagation()}>
+            <div className="verify-modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(255, 255, 255, 0.05)', paddingBottom: '1rem', marginBottom: '1.25rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Calculator className="logo-icon" size={24} style={{ color: 'var(--accent-hover)' }} />
+                <h2 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 800 }}>Calculation & OCR Audit Report</h2>
+              </div>
+              <button 
+                onClick={() => setShowVerifyModal(false)} 
+                aria-label="Close report"
+                style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+              >
+                <X size={20} />
+              </button>
+            </div>
+            
+            <div className="verify-modal-body">
+              {(() => {
+                const scraped = results.data.billing_summary;
+                const calculated = calculatedSummary;
+                
+                const comparisons = [
+                  {
+                    name: 'Total Energy Charges (A)',
+                    scrapVal: scraped?.total_energy_charges,
+                    calcVal: calculated.total_energy_charges,
+                  },
+                  {
+                    name: 'Total Additional Charges (B)',
+                    scrapVal: scraped?.total_additional_charges,
+                    calcVal: calculated.total_additional_charges,
+                  },
+                  {
+                    name: 'Total Miscellaneous Charges (D)',
+                    scrapVal: scraped?.total_miscellaneous_charges,
+                    calcVal: calculated.total_miscellaneous_charges,
+                  },
+                  {
+                    name: 'Total Arrear & LPS Charges (E)',
+                    scrapVal: scraped?.total_arrears_lps,
+                    calcVal: calculated.total_arrears_lps,
+                  },
+                  {
+                    name: 'Net Bill Amount (Subtotal F)',
+                    scrapVal: scraped?.net_bill_amount,
+                    calcVal: calculated.net_bill_amount,
+                  },
+                  {
+                    name: 'Prompt Payment Rebate (1%)',
+                    scrapVal: scraped?.rebate,
+                    calcVal: calculated.rebate,
+                  },
+                  {
+                    name: 'Payable Till Due Date',
+                    scrapVal: scraped?.payable_till_due_date,
+                    calcVal: calculated.payable_till_due_date,
+                  },
+                  {
+                    name: 'Payable After Due Date',
+                    scrapVal: scraped?.payable_after_due_date,
+                    calcVal: calculated.payable_after_due_date,
+                  }
+                ];
+                
+                const discrepancies = comparisons.filter(c => Math.abs((c.scrapVal || 0) - c.calcVal) >= 1.0);
+                const allMatch = discrepancies.length === 0;
+                
+                return (
+                  <>
+                    <div className={`verify-alert-banner ${allMatch ? 'success' : 'warning'}`} style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem', borderRadius: '8px', marginBottom: '1.25rem', background: allMatch ? 'rgba(16, 185, 129, 0.1)' : 'rgba(245, 158, 11, 0.1)', border: allMatch ? '1px solid rgba(16, 185, 129, 0.2)' : '1px solid rgba(245, 158, 11, 0.2)', textAlign: 'left' }}>
+                      {allMatch ? (
+                        <>
+                          <CheckCircle2 size={24} style={{ color: 'var(--success-color)', flexShrink: 0 }} />
+                          <div>
+                            <strong style={{ display: 'block', fontSize: '0.95rem' }}>Verification Successful!</strong>
+                            <p style={{ margin: '4px 0 0 0', fontSize: '0.825rem', color: 'var(--text-secondary)' }}>
+                              Calculated values from individual components match the scraped values perfectly.
+                            </p>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <Info size={24} style={{ color: 'var(--warning-color)', flexShrink: 0 }} />
+                          <div>
+                            <strong style={{ display: 'block', fontSize: '0.95rem' }}>Discrepancy Detected</strong>
+                            <p style={{ margin: '4px 0 0 0', fontSize: '0.825rem', color: 'var(--text-secondary)' }}>
+                              Differences found in {discrepancies.length} summary metrics. See comparison table below.
+                            </p>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                    
+                    <div style={{ overflowX: 'auto' }}>
+                      <table className="verify-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+                        <thead>
+                          <tr style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                            <th style={{ textAlign: 'left', padding: '0.75rem 0.5rem', color: 'var(--text-secondary)', fontWeight: 600 }}>Billing Metric</th>
+                            <th style={{ textAlign: 'right', padding: '0.75rem 0.5rem', color: 'var(--text-secondary)', fontWeight: 600 }}>Scraped (OCR)</th>
+                            <th style={{ textAlign: 'right', padding: '0.75rem 0.5rem', color: 'var(--text-secondary)', fontWeight: 600 }}>Calculated</th>
+                            <th style={{ textAlign: 'center', padding: '0.75rem 0.5rem', color: 'var(--text-secondary)', fontWeight: 600 }}>Audit Status</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {comparisons.map((item, idx) => {
+                            const scrap = item.scrapVal || 0;
+                            const calc = item.calcVal;
+                            const diff = calc - scrap;
+                            const isMatch = Math.abs(diff) < 1.0;
+                            
+                            return (
+                              <tr key={idx} style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.04)', background: isMatch ? 'transparent' : 'rgba(239, 68, 68, 0.02)' }}>
+                                <td style={{ padding: '0.85rem 0.5rem', fontWeight: 600, textAlign: 'left' }}>{item.name}</td>
+                                <td style={{ padding: '0.85rem 0.5rem', textAlign: 'right', color: 'var(--text-secondary)' }}>
+                                  {formatCurrency(item.scrapVal)}
+                                </td>
+                                <td style={{ padding: '0.85rem 0.5rem', textAlign: 'right', fontWeight: 700 }}>
+                                  {formatCurrency(item.calcVal)}
+                                </td>
+                                <td style={{ padding: '0.85rem 0.5rem', textAlign: 'center' }}>
+                                  {isMatch ? (
+                                    <span style={{ fontSize: '0.75rem', fontWeight: 700, padding: '2px 8px', borderRadius: '12px', background: 'rgba(16, 185, 129, 0.15)', color: 'var(--success-color)' }}>✅ Match</span>
+                                  ) : (
+                                    <span 
+                                      style={{ fontSize: '0.75rem', fontWeight: 700, padding: '2px 8px', borderRadius: '12px', background: 'rgba(239, 68, 68, 0.15)', color: 'var(--danger-color)', cursor: 'help' }} 
+                                      title={`Diff: ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}`}
+                                    >
+                                      ⚠️ {diff >= 0 ? '+' : ''}{formatCurrency(diff, 0)}
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    
+                    <div className="verify-modal-actions" style={{ marginTop: '1.75rem', display: 'flex', gap: '1rem', justifyContent: 'flex-end' }}>
+                      <button 
+                        className="btn-apply-calculated"
+                        onClick={applyCalculatedTotals}
+                        style={{ 
+                          background: 'linear-gradient(135deg, var(--success-color) 0%, #059669 100%)', 
+                          color: '#fff', 
+                          border: 'none', 
+                          padding: '0.65rem 1.25rem', 
+                          borderRadius: '8px', 
+                          fontWeight: 700, 
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          boxShadow: '0 4px 12px rgba(16, 185, 129, 0.2)'
+                        }}
+                      >
+                        <CheckCircle2 size={16} />
+                        Apply Calculated Totals
+                      </button>
+                      <button 
+                        className="btn-dismiss-modal"
+                        onClick={() => setShowVerifyModal(false)}
+                        style={{ 
+                          background: 'rgba(255, 255, 255, 0.05)', 
+                          border: '1px solid rgba(255, 255, 255, 0.1)', 
+                          color: 'var(--text-primary)', 
+                          padding: '0.65rem 1.25rem', 
+                          borderRadius: '8px', 
+                          fontWeight: 600, 
+                          cursor: 'pointer' 
+                        }}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
