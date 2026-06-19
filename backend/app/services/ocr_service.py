@@ -1,5 +1,4 @@
-import pytesseract
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps
 import pdfplumber
 from pdf2image import convert_from_bytes
 import io
@@ -7,20 +6,25 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Configure pytesseract binary path (installed via homebrew on Mac)
-pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+# Lazy loaded surya predictors to keep startup latency minimal
+_foundation_predictor = None
+_det_predictor = None
+_rec_predictor = None
 
-# Tesseract tuning.
-# --oem 3  : default LSTM engine.
-# --psm 6  : assume a single uniform block of text. Works far better than the
-#            default (psm 3) for the dense tabular layout of an energy bill,
-#            because it stops Tesseract from splitting columns into separate
-#            blocks and dropping numbers.
-# preserve_interword_spaces=1 : keep the column spacing so the LLM can still
-#            see which number belongs to which column.
-TESSERACT_CONFIG = r"--oem 3 --psm 6 -c preserve_interword_spaces=1"
-# Fallback config used if psm 6 yields very little text (e.g. sparse layouts).
-TESSERACT_CONFIG_FALLBACK = r"--oem 3 --psm 4 -c preserve_interword_spaces=1"
+
+def get_surya_predictors():
+    """Lazily load Surya OCR predictors and models to minimize startup latency."""
+    global _foundation_predictor, _det_predictor, _rec_predictor
+    if _foundation_predictor is None:
+        logger.info("Initializing Surya OCR Predictors and loading PyTorch weights...")
+        from surya.foundation import FoundationPredictor
+        from surya.detection import DetectionPredictor
+        from surya.recognition import RecognitionPredictor
+        
+        _foundation_predictor = FoundationPredictor()
+        _det_predictor = DetectionPredictor()
+        _rec_predictor = RecognitionPredictor(_foundation_predictor)
+    return _det_predictor, _rec_predictor
 
 # Minimum width (px) we want before running OCR. Low-res phone photos (e.g.
 # 960px wide) render dense table digits at ~8px tall, below Tesseract's reliable
@@ -34,12 +38,12 @@ PDF_RENDER_DPI = 300
 
 def preprocess_image(image: Image.Image) -> Image.Image:
     """
-    Clean up an image so Tesseract can read every value on a dense bill.
+    Clean up an image so Tesseract/Surya can read every value on a dense bill.
 
     NOTE: we deliberately do NOT binarise (hard black/white threshold). Testing
     on real low-res bill photos showed a global threshold WIPES the faint
     lower-section rows and corrupts digits (e.g. turning 2,386,211 into
-    2,586,211). Tesseract 5's LSTM engine reads grayscale well, so we keep a
+    2,586,211). The LSTM engine reads grayscale well, so we keep a
     high-bit-depth grayscale image and only normalise contrast.
 
     Steps:
@@ -69,25 +73,62 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     return image
 
 
+def group_lines_into_rows(lines, y_threshold=8) -> str:
+    """
+    Group lines that share overlapping vertical coordinates (representing a table row)
+    and sort columns horizontally from left to right.
+    """
+    sorted_lines = sorted(lines, key=lambda l: l.bbox[1])
+    rows = []
+    
+    for line in sorted_lines:
+        bbox = line.bbox  # [xmin, ymin, xmax, ymax]
+        placed = False
+        for row in rows:
+            row_ymin = min(l.bbox[1] for l in row)
+            row_ymax = max(l.bbox[3] for l in row)
+            row_height = row_ymax - row_ymin
+            
+            overlap = min(bbox[3], row_ymax) - max(bbox[1], row_ymin)
+            line_height = bbox[3] - bbox[1]
+            
+            if overlap > 0.4 * min(line_height, row_height) or abs(bbox[1] - row_ymin) < y_threshold:
+                row.append(line)
+                placed = True
+                break
+                
+        if not placed:
+            rows.append([line])
+            
+    reconstructed_lines = []
+    for row in rows:
+        sorted_row = sorted(row, key=lambda l: l.bbox[0])
+        row_text = " | ".join(l.text.strip() for l in sorted_row)
+        reconstructed_lines.append(row_text)
+        
+    return "\n".join(reconstructed_lines)
+
+
 def _ocr_image(image: Image.Image) -> str:
     """
-    Run Tesseract with psm 6 (best for dense bill tables), falling back to psm 4
-    only if psm 6 returns almost nothing. A single clean pass is given to the
-    LLM: feeding it two overlapping noisy passes was found to confuse column
-    alignment on small models rather than help.
+    Run Surya OCR on the image and reconstruct the layout into structured Markdown.
     """
-    text = pytesseract.image_to_string(image, config=TESSERACT_CONFIG).strip()
-    if len(text) < 50:
-        logger.info("Primary OCR pass returned little text; retrying with psm 4.")
-        fallback = pytesseract.image_to_string(image, config=TESSERACT_CONFIG_FALLBACK).strip()
-        if len(fallback) > len(text):
-            text = fallback
-    return text
+    det_predictor, rec_predictor = get_surya_predictors()
+    
+    # Run recognition (Surya automatically handles English and Hindi)
+    predictions = rec_predictor([image], det_predictor=det_predictor)
+    
+    page_result = predictions[0]
+    text_lines = page_result.text_lines
+    
+    # Reconstruct column-aligned layout
+    text = group_lines_into_rows(text_lines)
+    return text.strip()
 
 
 def extract_text_from_image(image_bytes: bytes) -> str:
     """
-    Extracts text from image bytes (JPEG, PNG, etc.) using Tesseract OCR.
+    Extracts text from image bytes (JPEG, PNG, etc.) using Surya OCR.
     The image is preprocessed first to maximise the number of values captured.
     """
     try:
@@ -130,7 +171,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     Extracts text from PDF bytes.
     First tries to extract digital text + tables using pdfplumber.
     If no text is found (scanned PDF), converts pages to images at high DPI,
-    preprocesses them, and runs Tesseract OCR.
+    preprocesses them, and runs Surya OCR.
     """
     extracted_text = ""
 

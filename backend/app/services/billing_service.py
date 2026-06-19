@@ -1,21 +1,14 @@
-import httpx
-import json
-import logging
 import re
+import copy
+import logging
 
 logger = logging.getLogger(__name__)
-
-OLLAMA_HOST = "http://122.186.70.126:11434"
-BASE_URL = f"{OLLAMA_HOST}/v1"  # OpenAI-compatible endpoint (used for /models listing)
 
 # Category labels used on these bills, in printed order.
 CAT_ENERGY = "Current Demand and Energy Charges After Open Access"
 CAT_ADDITIONAL = "Additional Charges"
 CAT_MISC = "Miscellaneous Charges"
 CAT_ARREAR = "Arrear and LPS Charges"
-
-# Models on the server that can accept images (vision capability).
-VISION_MODELS = {"gemma4:12b", "gemma4:e4b"}
 
 # Standard tariff percentages for THIS bill format (PVVNL/UPPCL HV-2). Used ONLY
 # as a fallback to compute FPPA (% of energy charges A) and Electricity Duty
@@ -26,31 +19,6 @@ VISION_MODELS = {"gemma4:12b", "gemma4:e4b"}
 FPPA_PCT_DEFAULT = None
 DUTY_PCT_DEFAULT = 7.5
 
-
-async def fetch_available_models() -> list[str]:
-    """
-    Fetches available models from the Ollama API endpoint.
-    """
-    url = f"{BASE_URL}/models"
-    headers = {"Authorization": "Bearer ollama"}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                models = [model["id"] for model in data.get("data", [])]
-                return models
-            else:
-                logger.error(f"Failed to fetch models, status: {response.status_code}")
-                return []
-    except Exception as e:
-        logger.error(f"Error fetching models: {e}")
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Deterministic reconciliation helpers
-# ---------------------------------------------------------------------------
 
 def _to_number(value):
     """Coerce an OCR/LLM value to a float, tolerating commas, currency symbols
@@ -126,22 +94,91 @@ def _snap_to_ocr(amount, ocr_numbers):
     return amount
 
 
+def extract_raw_scraped_values(data: dict) -> dict:
+    """
+    Extracts the raw printed/scraped subtotal values from the bill data
+    BEFORE any reconciliation or formula recalculation overwrites them.
+    """
+    components = data.get("bill_components") or []
+    summary = data.get("billing_summary") or {}
+    
+    # 1. Demand charges (scraped)
+    demand_charges = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if ("fixed" in name or "demand" in name) and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            demand_charges = _to_number(c.get("amount")) or 0.0
+            break
+            
+    # 2. Energy charges (scraped)
+    energy_charges = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if "tod" in name and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            energy_charges += _to_number(c.get("amount")) or 0.0
+            
+    # 3. Net Misc charges (scraped)
+    fppa = 0.0
+    rebate_adj = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if ("fppa" in name or "fuel" in name) and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            fppa = _to_number(c.get("amount")) or 0.0
+        if ("due date rebate" in name or "rebate adjustment" in name) and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            rebate_adj = _to_number(c.get("amount")) or 0.0
+            
+    # Electricity duty (scraped)
+    duty = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if ("duty" in name or "electricity duty" in name) and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            duty = _to_number(c.get("amount")) or 0.0
+            break
+            
+    # Arrears (scraped)
+    arrears = _to_number(summary.get("total_arrears_lps")) or 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if "arrear" in name and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            arrears = _to_number(c.get("amount")) or 0.0
+            break
+            
+    # Net Bill (scraped)
+    net_bill = _to_number(summary.get("net_bill_amount")) or 0.0
+    
+    # Net Current Bill (scraped)
+    if net_bill > 0:
+        net_current = round(net_bill - arrears)
+    else:
+        net_current = round(demand_charges + energy_charges + duty + fppa + rebate_adj)
+    if net_current < 0:
+        net_current = 0.0
+        
+    # Rebate (scraped)
+    rebate = _to_number(summary.get("rebate")) or 0.0
+    
+    # Payable till due date (scraped)
+    payable_till = _to_number(summary.get("payable_till_due_date")) or 0.0
+    
+    return {
+        "demand_charges": round(demand_charges),
+        "energy_charges": round(energy_charges),
+        "net_misc_charges": round(fppa + rebate_adj),
+        "electricity_duty": round(duty),
+        "net_current_bill": round(net_current),
+        "arrear_amount": round(arrears),
+        "final_payable_amount": round(net_bill),
+        "rebate": round(rebate),
+        "payable_till_due_date": round(payable_till)
+    }
+
+
 def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
     """
     Deterministically fix the arithmetic of an extracted bill so the result is
-    exact and internally consistent. The LLM transcribes values; this function
-    owns every calculation:
-
-      * reading tables: total_consumption = difference * multiplying_factor
-      * charge rows: recover a mis-read amount as consumption * rate, and a
-        mis-read rate as amount / consumption (fixes magnitude/decimal slips)
-      * subtotals A (energy), B (additional), D (misc), E (arrear) = sum of each
-        section's line-item amounts; C = A + B; net/F = A + B + D + E
-      * billing_summary repopulated from the reconciled subtotals
-      * a confidence flag when the computed net disagrees with the printed net
-
-    Works for any bill of this layout (no hard-coded figures).
+    exact and internally consistent.
     """
+    raw_scraped = extract_raw_scraped_values(copy.deepcopy(data))
     # --- 1. Reading tables: total = difference * MF. ---
     for table in data.get("reading_tables") or []:
         for r in table.get("readings") or []:
@@ -463,10 +500,10 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
     payable_till = round(net - rebate, 2)
 
     # --- 6. Repopulate billing_summary from reconciled values. ---
-    summary["total_energy_charges"] = A if hasA else summary.get("total_energy_charges")
-    summary["total_additional_charges"] = B if hasB else summary.get("total_additional_charges")
-    summary["total_miscellaneous_charges"] = D if hasD else summary.get("total_miscellaneous_charges")
-    summary["total_arrears_lps"] = E if hasE else summary.get("total_arrears_lps")
+    summary["total_energy_charges"] = A
+    summary["total_additional_charges"] = B
+    summary["total_miscellaneous_charges"] = D
+    summary["total_arrears_lps"] = E
     summary["net_bill_amount"] = net
     summary["rebate"] = rebate
     summary["payable_till_due_date"] = payable_till
@@ -566,200 +603,188 @@ def reconcile_bill_data(data: dict, ocr_text: str | None = None) -> dict:
         if summary.get(k) is not None:
             summary[k] = _round_money(summary.get(k))
 
+    # Run the exact 5-step billing formulas calculation to snap all components and summaries
+    calc_res = calculate_bill_formulas(data, raw_scraped=raw_scraped)
+    data = calc_res["data"]
+    # Store backend audit calculations so frontend can access them directly without recalculating
+    data["audit_calculations"] = calc_res["calculations"]
+
     return data
 
 
-# ---------------------------------------------------------------------------
-# LLM extraction
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """You are an expert energy-bill data extractor. You receive an electricity bill (as an IMAGE and/or its OCR text) and return ONE valid JSON object describing it.
-
-IMPORTANT OUTPUT DISCIPLINE: respond with ONLY the JSON object — no explanation, no reasoning, no markdown fences. Your entire reply is the JSON.
-
-When BOTH an image and OCR text are provided:
-- The OCR TEXT is AUTHORITATIVE for every numeric digit and amount. Copy amounts, consumptions, rates and readings VERBATIM from the OCR text — do not shorten, round, or drop digits.
-- Use the IMAGE to understand the table LAYOUT and WHICH SECTION each charge belongs to, and to spot rows the OCR may have missed.
-- If a number is legible in the OCR text, always prefer that exact figure over what you think you see in the image.
-
-Your job is EXTRACTION ONLY. Do NOT compute totals/percentages/net yourself — a downstream program does all arithmetic and reconciliation. Just transcribe what you see.
-
-The JSON MUST match this structure:
-{
-  "utility_provider": "Name of the utility company",
-  "customer_details": { "name": ..., "billing_address": ..., "service_address": ... },
-  "billing_details": {
-    "account_number": ..., "meter_number": ..., "invoice_number": ...,
-    "bill_date": "YYYY-MM-DD", "due_date": "YYYY-MM-DD", "discont_date": "YYYY-MM-DD",
-    "billing_period": { "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" },
-    "contracted_demand_kva": 0.0, "billable_demand_kva": 0.0,
-    "tariff_code": ..., "supply_voltage": ...
-  },
-  "reading_tables": [
-    { "reading_from": "date range",
-      "readings": [ { "zone_name": ..., "present_reading": 0.0, "past_reading": 0.0,
-                      "difference": 0.0, "multiplying_factor": 0.0, "total_consumption": 0.0 } ] }
-  ],
-  "bill_components": [
-    { "sno": "1/2/A/B...", "category": "<one of the four category strings>",
-      "component_name": "...", "consumption": 0.0, "rate": 0.0, "unit": "...", "amount": 0.0 }
-  ],
-  "billing_summary": {
-    "total_energy_charges": 0.0, "total_additional_charges": 0.0,
-    "total_miscellaneous_charges": 0.0, "total_arrears_lps": 0.0,
-    "net_bill_amount": 0.0, "rebate": 0.0,
-    "payable_till_due_date": 0.0, "payable_after_due_date": 0.0
-  },
-  "raw_ocr_analysis_notes": "..."
-}
-
-Rules:
-- Use null for fields not present. Convert dates to YYYY-MM-DD. Clean numbers (strip commas/currency) to plain numbers. Never write arithmetic expressions in any value.
-- Extract every reading-period table separately with its date range and every TOD zone present.
-- Capture EVERY row of the 'Bill Component' table: each charge line AND each subtotal/total row (Sno A, B, C, D, E, F, etc. when printed).
-- Classify each row into one of the four categories under the `category` field:
-  * 'Current Demand and Energy Charges After Open Access': Fixed/Demand Charges, Energy Charges TOD-1..n, and Total Energy Charges (A).
-  * 'Additional Charges': FPPA/fuel surcharge, Excess Demand Penalty, and Total Additional Charges (B) / Total (A+B) (C).
-  * 'Miscellaneous Charges': Electricity Duty, Due date rebate adjustment, other misc. charges, and Total Miscellaneous Charge (D).
-  * 'Arrear and LPS Charges': Arrears, Surcharge LPS, and Total Arrears & LPS (E).
-- Do NOT duplicate any row. If FPPA Surcharge, Electricity Duty, or Due date rebate adjustment are listed in a separate breakdown table (like 'Details of Miscellaneous Charges'), extract them once under their correct categories and do NOT duplicate them.
-- If a subtotal or total row is not explicitly printed on the bill, do NOT synthesize it. Just extract the printed rows.
-- Reconcile names and categories:
-  - Fixed/Demand Charges (िफकसड/मांग पभार) -> 'Current Demand and Energy Charges After Open Access'
-  - TOD Energy Charges / Time of Day Charges -> 'Current Demand and Energy Charges After Open Access'
-  - FPPA Surcharge (ईधन और िबजली अिधभार) -> 'Additional Charges'
-  - Electricity Duty (िवदुत कर) -> 'Miscellaneous Charges'
-  - Due date rebate adjustment (देय ितिथ छूट समायोजन) -> 'Miscellaneous Charges'
-  - Arrear Amount (बकाया धनरािश) -> 'Arrear and LPS Charges'
-- Do NOT move a line into a section it is not printed under, and do NOT force a printed amount to zero (use 0 only when the bill shows 0/blank).
-
-FORMAT EXAMPLE (FICTITIOUS numbers — show mapping only, NEVER copy them):
-  1 Demand Charges 5000 300 /KVA/Mth 1500000 -> {"sno":"1","category":"Current Demand and Energy Charges After Open Access","component_name":"Demand Charges","consumption":5000,"rate":300,"unit":"/KVA/Mth","amount":1500000}
-  2 Energy ChargesTOD-1 100000 6.0 /KVAh 600000 -> category 'Current Demand and Energy Charges After Open Access'
-  A Total Energy Charges 2100000 -> category 'Current Demand and Energy Charges After Open Access'
-  1 Exc Dmd Penalty /KVA 0 -> category 'Additional Charges'
-  2 FPPA Charges @ 10% 210000 -> category 'Additional Charges'
-  B Total Additional Charges 210000 / C Total (A+B) 2310000 -> category 'Additional Charges'
-  1 Other Misc Charges 0.00 / 2 Electricity Duty 7.5% Of (Demand & Energy Charges) 173250 -> category 'Miscellaneous Charges'
-  D Total Miscellaneous Charge 173250 -> category 'Miscellaneous Charges'
-  1 Arrear 0.00 / 2 Surcharge LPS 5000 / E Total Arrears & LPS 5000 -> category 'Arrear and LPS Charges'
-Apply this same structure to the real bill regardless of the actual amounts."""
-
-
-async def analyze_bill_text(ocr_text: str, model: str, image_b64: list[str] | str | None = None,
-                            ocr_text_for_snap: str | None = None) -> dict:
+def calculate_bill_formulas(data: dict, raw_scraped: dict | None = None) -> dict:
     """
-    Extract structured energy-bill data using a HYBRID of OCR text + the bill
-    image. When the model supports vision and an image is supplied, the image is
-    sent alongside the OCR text (image -> layout/classification, OCR -> exact
-    digits). Falls back to text-only otherwise. Output is reconciled
-    deterministically before returning.
-
-    image_b64: a base64 string (or list of them for multi-page PDFs), no data
-    URL prefix. Pass None for text-only extraction.
+    Recalculates the bill components, reading tables, and billing summary
+    using the user's exact 5-step formulas.
+    Returns a dict with:
+      "data": updated data dict (with updated totals/subtotals)
+      "calculations": dict containing step-by-step values (scraped & calculated)
     """
-    # Native /api/chat is required: only it honors think=False to disable the
-    # reasoning channel (the /v1 compat endpoint wastes the token budget on
-    # hidden reasoning and returns empty content for gemma4).
-    url = f"{OLLAMA_HOST}/api/chat"
+    if raw_scraped is None:
+        raw_scraped = extract_raw_scraped_values(data)
 
-    images = []
-    if image_b64:
-        images = [image_b64] if isinstance(image_b64, str) else list(image_b64)
-    use_vision = bool(images) and model in VISION_MODELS
+    # 1. Recalculate Reading Tables (Present - Past = Difference, Difference * MF = Total KWH)
+    for table in data.get("reading_tables") or []:
+        for r in table.get("readings") or []:
+            present = _to_number(r.get("present_reading"))
+            past = _to_number(r.get("past_reading"))
+            if present is not None and past is not None:
+                r["difference"] = round(present - past, 3)
+            diff = _to_number(r.get("difference"))
+            mf = _to_number(r.get("multiplying_factor"))
+            if diff is not None and mf is not None:
+                r["total_consumption"] = round(diff * mf, 2)
 
-    if use_vision:
-        user_text = (
-            "Extract the structured JSON for this electricity bill. You are given "
-            "the bill IMAGE plus its OCR text below. Use the image for layout and "
-            "section classification; use the OCR text for exact digits.\n\nOCR TEXT:\n"
-            + ocr_text
-        )
-        user_message = {"role": "user", "content": user_text, "images": images}
+    # 2. Recalculate Bill Component Amounts (Consumption * rate = Amount)
+    components = data.get("bill_components") or []
+    for c in components:
+        if _is_subtotal(c.get("sno"), c.get("component_name")):
+            continue
+        cons = _to_number(c.get("consumption"))
+        rate = _to_number(c.get("rate"))
+        if cons is not None and rate is not None and cons > 0 and rate > 0:
+            c["amount"] = round(cons * rate)
+
+    # 3. Step A: Contracted Demand Charges
+    demand_charges = 0.0
+    billed_demand = 0.0
+    demand_rate = 0.0
+    demand_comp = None
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if ("fixed" in name or "demand" in name) and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            demand_comp = c
+            break
+    if demand_comp:
+        demand_rate = _to_number(demand_comp.get("rate")) or 0.0
+        billed_demand = _to_number(demand_comp.get("consumption")) or 0.0
+        demand_charges = round(billed_demand * demand_rate)
+        demand_comp["amount"] = demand_charges
     else:
-        if images and not use_vision:
-            logger.info(f"Model {model} is not vision-capable; using OCR text only.")
-        user_message = {"role": "user", "content": f"Here is the raw energy bill OCR text:\n\n{ocr_text}"}
+        bd = data.get("billing_details") or {}
+        billed_demand = _to_number(bd.get("billable_demand_kva")) or 0.0
+        demand_charges = round(billed_demand * 290.0)
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            user_message,
-        ],
-        "stream": False,
-        "think": False,          # disable reasoning channel (native API only)
-        "format": "json",        # constrain output to a JSON object
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 8192,
-            "num_ctx": 16384,
-        },
+    # Step B: Energy Charges (ToD Based)
+    energy_charges = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if "tod" in name and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            energy_charges += _to_number(c.get("amount")) or 0.0
+    energy_charges = round(energy_charges)
+
+    # Step C: Net Miscellaneous Charges
+    fppa_surcharge = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if ("fppa" in name or "fuel" in name) and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            fppa_surcharge = _to_number(c.get("amount")) or 0.0
+            break
+
+    rebate_adjustment = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if ("due date rebate" in name or "rebate adjustment" in name) and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            rebate_adjustment = _to_number(c.get("amount")) or 0.0
+            break
+
+    net_misc_charges = round(fppa_surcharge + rebate_adjustment)
+
+    # Step D: Net Current Bill
+    electricity_duty = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if ("duty" in name or "electricity duty" in name) and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            electricity_duty = _to_number(c.get("amount")) or 0.0
+            break
+
+    net_current_bill = round(demand_charges + energy_charges + electricity_duty + net_misc_charges)
+
+    # Step E: Final Payable Amount
+    arrear_amount = 0.0
+    for c in components:
+        name = str(c.get("component_name") or "").lower()
+        if "arrear" in name and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            arrear_amount = _to_number(c.get("amount")) or 0.0
+            break
+    if arrear_amount == 0.0:
+        summary = data.get("billing_summary") or {}
+        arrear_amount = _to_number(summary.get("total_arrears_lps")) or 0.0
+
+    original_summary = data.get("billing_summary") or {}
+    original_net = _to_number(original_summary.get("net_bill_amount"))
+
+    final_payable = round(net_current_bill + arrear_amount)
+
+    # Snap calculated final payable to original net bill if close (handles component rounding discrepancies)
+    if original_net and original_net > 0 and abs(final_payable - original_net) <= 2.0:
+        final_payable = round(original_net)
+
+    # Prompt Payment Rebate
+    has_detailed_misc = any(
+        any(k in str(c.get("component_name") or "").lower() for k in ("fppa", "due date rebate", "rebate adjustment"))
+        for c in components if not _is_subtotal(c.get("sno"), c.get("component_name"))
+    )
+    if has_detailed_misc:
+        rebate = round((demand_charges + energy_charges + fppa_surcharge) * 0.01)
+    else:
+        rebate = round((demand_charges + energy_charges + electricity_duty) * 0.01)
+
+    payable_till_due = round(final_payable - rebate)
+
+    # Update all subtotal rows in components list
+    for c in components:
+        sno = str(c.get("sno") or "").strip().upper().rstrip(".")
+        name = str(c.get("component_name") or "").strip().upper()
+
+        if sno == "A" or "TOTAL ENERGY" in name:
+            c["amount"] = round(demand_charges + energy_charges)
+        elif sno == "B" or "TOTAL ADDITIONAL" in name:
+            c["amount"] = round(fppa_surcharge)
+        elif sno == "C" or "TOTAL (A+B)" in name:
+            c["amount"] = round(demand_charges + energy_charges + fppa_surcharge)
+        elif sno == "D" or "TOTAL MISCELLANEOUS" in name:
+            c["amount"] = round(electricity_duty + rebate_adjustment)
+        elif sno == "E" or "TOTAL ARREARS" in name:
+            c["amount"] = round(arrear_amount)
+        elif sno == "F" or sno == "TOTAL" or name == "TOTAL" or "GRAND TOTAL" in name or "NET BILL AMOUNT" in name:
+            c["amount"] = final_payable
+
+    # Update summary dict
+    summary = data.get("billing_summary") or {}
+    summary["total_energy_charges"] = round(demand_charges + energy_charges)
+    summary["total_additional_charges"] = round(fppa_surcharge)
+    summary["total_miscellaneous_charges"] = round(electricity_duty + rebate_adjustment)
+    summary["total_arrears_lps"] = round(arrear_amount)
+    summary["net_bill_amount"] = final_payable
+    summary["rebate"] = rebate
+    summary["payable_till_due_date"] = payable_till_due
+    summary["payable_after_due_date"] = final_payable
+    data["billing_summary"] = summary
+
+    # Snap/sync billing details billable demand
+    bd = data.get("billing_details")
+    if isinstance(bd, dict) and billed_demand > 0:
+        bd["billable_demand_kva"] = billed_demand
+
+    return {
+        "data": data,
+        "calculations": {
+            "scraped": raw_scraped,
+            "calculated": {
+                "demand_charges": demand_charges,
+                "billed_demand": billed_demand,
+                "demand_rate": demand_rate,
+                "energy_charges": energy_charges,
+                "fppa_surcharge": fppa_surcharge,
+                "rebate_adjustment": rebate_adjustment,
+                "net_misc_charges": net_misc_charges,
+                "electricity_duty": electricity_duty,
+                "net_current_bill": net_current_bill,
+                "arrear_amount": arrear_amount,
+                "final_payable_amount": final_payable,
+                "rebate": rebate,
+                "payable_till_due_date": payable_till_due
+            }
+        }
     }
-
-    headers = {"Authorization": "Bearer ollama", "Content-Type": "application/json"}
-
-    content = ""
-    try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            if response.status_code == 401:
-                raise RuntimeError("Unauthorized access to LLM model. (Model might require cloud credentials).")
-            if response.status_code != 200:
-                raise RuntimeError(f"LLM API returned non-200 status: {response.status_code} - {response.text}")
-
-            result_json = response.json()
-            message = result_json.get("message", {})
-            content = (message.get("content") or "").strip()
-
-            # Fallback: recover JSON from a 'thinking' channel if content empty.
-            if not content:
-                thinking = message.get("thinking") or ""
-                brace = thinking.find("{")
-                if brace != -1:
-                    content = thinking[brace:thinking.rfind("}") + 1].strip()
-                    logger.warning("LLM 'content' empty; recovered JSON from 'thinking' channel.")
-            if not content:
-                raise RuntimeError(
-                    f"LLM returned empty content (done_reason={result_json.get('done_reason')})."
-                )
-
-            # Strip markdown fences if present.
-            if content.startswith("```"):
-                content = re.sub(r"^```(?:json)?\n", "", content)
-                content = re.sub(r"\n```$", "", content).strip()
-
-            # Remove trailing commas.
-            content = re.sub(r",\s*([\}\]])", r"\1", content)
-
-            # Resolve any stray arithmetic expressions the model wrote in values.
-            def evaluate_match(m):
-                expr = m.group(1).strip()
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", expr):
-                    return m.group(0)
-                try:
-                    if re.match(r"^[\d\.\s\+\-\*\/]+$", expr):
-                        return f": {eval(expr)}"
-                except Exception:
-                    pass
-                return m.group(0)
-
-            content = re.sub(r":\s*([\d\.]+(?:\s*[\+\-\*\/]\s*[\d\.]+)+)", evaluate_match, content)
-
-            import json_repair
-            try:
-                parsed_data = json_repair.loads(content)
-            except Exception as jre:
-                logger.warning(f"json_repair failed: {jre}, falling back to json.loads")
-                parsed_data = json.loads(content)
-
-            if isinstance(parsed_data, dict):
-                parsed_data = reconcile_bill_data(parsed_data, ocr_text_for_snap or ocr_text)
-            return parsed_data
-
-    except httpx.TimeoutException as te:
-        logger.error(f"LLM request timed out: {te}")
-        raise RuntimeError("LLM request timed out. The model took too long to respond.")
-    except Exception as e:
-        logger.error(f"Error in LLM analysis: {e}. Raw content (if any): {content[:300]}")
-        raise RuntimeError(f"Failed to analyze bill text: {str(e)}")
