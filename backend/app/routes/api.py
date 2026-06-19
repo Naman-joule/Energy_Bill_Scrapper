@@ -27,3 +27,13 @@ async def calculate_bill(payload: BillData):
     Recalculates the bill data using the backend python engine and the user's 5-step billing formulas.
     """
     return BillController.calculate_bill(payload)
+
+@router.post("/block-data")
+async def get_block_data(payload: BillData):
+    """
+    Generates 15-minute interval (block-wise) energy consumption data
+    for the entire billing month, distributed by TOD zone.
+    Returns total_days × 96 records (e.g. 30 × 96 = 2880 rows).
+    """
+    return BillController.get_block_data(payload)
+

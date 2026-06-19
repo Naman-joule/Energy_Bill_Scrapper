@@ -1,5 +1,6 @@
 import ExcelJS from 'exceljs';
 import type { BillData } from '../types/bill';
+import type { BlockDataResponse } from './api';
 
 // ─── Design Tokens ────────────────────────────────────────────────────────────
 const C = {
@@ -22,6 +23,14 @@ const C = {
   negativeFg:     'FFDC2626',   // Red-600
   noteBg:         'FFFFFBEB',   // Amber-50
   noteFg:         'FF92400E',   // Amber-800
+
+  // TOD Zone colours
+  zone1Bg:        'FFFEF3C7',   // Amber-100  – Peak
+  zone1Fg:        'FF92400E',   // Amber-800
+  zone2Bg:        'FFD1FAE5',   // Emerald-100 – Normal
+  zone2Fg:        'FF065F46',   // Emerald-800
+  zone3Bg:        'FFE0E7FF',   // Indigo-100 – Off-Peak/Night
+  zone3Fg:        'FF3730A3',   // Indigo-800
 };
 
 const FONT_NAME = 'Calibri';
@@ -488,3 +497,190 @@ export async function exportToXLSX(editableData: BillData): Promise<void> {
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
 }
+
+// ─── Zone colour helper ────────────────────────────────────────────────────────
+function zoneColors(zone: string): { bg: string; fg: string } {
+  const z = zone.toLowerCase();
+  if (z.includes('tod-1') || z.includes('peak')) return { bg: C.zone1Bg, fg: C.zone1Fg };
+  if (z.includes('tod-2') || z.includes('normal')) return { bg: C.zone2Bg, fg: C.zone2Fg };
+  return { bg: C.zone3Bg, fg: C.zone3Fg };  // TOD-3 / Off-Peak / Night
+}
+
+// ─── Block-data XLSX export ────────────────────────────────────────────────────
+export async function exportBlockDataToXLSX(
+  blockData: BlockDataResponse,
+  billData: BillData,
+): Promise<void> {
+  const wb = new ExcelJS.Workbook();
+  wb.creator         = 'Energy Bill Scrapper';
+  wb.lastModifiedBy  = 'Energy Bill Scrapper';
+  wb.created         = new Date();
+  wb.modified        = new Date();
+
+  // ── Sheet 1: TOD Zone Summary ────────────────────────────────────────────────
+  const wsSummary = wb.addWorksheet('TOD Summary', {
+    views: [{ state: 'normal', showGridLines: false }],
+  });
+
+  wsSummary.columns = [
+    { width: 28 }, // A – Zone
+    { width: 18 }, // B – Total Consumption (kWh)
+    { width: 16 }, // C – Blocks/day
+    { width: 16 }, // D – Total Blocks
+    { width: 22 }, // E – Consumption/Block (kWh)
+    { width: 18 }, // F – Rate (Rs/kWh)
+    { width: 20 }, // G – Total Amount (Rs)
+  ];
+
+  // Title
+  wsSummary.mergeCells('A1:G1');
+  const titleCell = wsSummary.getCell('A1');
+  titleCell.value = `15-Min Block Data — TOD Summary  |  ${billData.utility_provider ?? ''}`;
+  styleCell(titleCell, { bold: true, size: 14, fgColor: C.titleFg, bgColor: C.titleBg, hAlign: 'center' });
+  wsSummary.getRow(1).height = 32;
+
+  // Sub-header
+  wsSummary.mergeCells('A2:G2');
+  const subCell = wsSummary.getCell('A2');
+  subCell.value = `Billing Period: ${blockData.billing_period.start_date} → ${blockData.billing_period.end_date}  |  ${blockData.billing_period.total_days} days  |  ${blockData.billing_period.total_blocks.toLocaleString('en-IN')} total blocks`;
+  styleCell(subCell, { italic: true, size: 9, fgColor: 'FF94A3B8', bgColor: C.titleBg, hAlign: 'center' });
+  wsSummary.getRow(2).height = 18;
+
+  // Column headers
+  const summHeaders = ['TOD Zone', 'Total Consumption (kWh)', 'Blocks/Day', 'Total Blocks', 'Consumption/Block (kWh)', 'Rate (₹/kWh)', 'Total Amount (₹)'];
+  summHeaders.forEach((h, i) => {
+    const cell = wsSummary.getCell(3, i + 1);
+    cell.value = h;
+    styleCell(cell, { bold: true, size: 10, fgColor: C.colHeaderFg, bgColor: C.colHeaderBg,
+      hAlign: i >= 1 ? 'right' : 'left', borderStyle: 'medium' });
+  });
+  wsSummary.getRow(3).height = 22;
+
+  let grandTotalConsumption = 0;
+  let grandTotalAmount = 0;
+
+  blockData.tod_summary.forEach((zone, idx) => {
+    const zrow = idx + 4;
+    const { bg, fg } = zoneColors(zone.zone);
+    const totalAmt = zone.total_consumption_kwh * zone.rate_per_kwh;
+    grandTotalConsumption += zone.total_consumption_kwh;
+    grandTotalAmount      += totalAmt;
+
+    const vals = [
+      zone.zone,
+      zone.total_consumption_kwh,
+      zone.blocks_per_day,
+      zone.total_blocks,
+      zone.consumption_per_block,
+      zone.rate_per_kwh,
+      totalAmt,
+    ];
+    vals.forEach((v, i) => {
+      const cell = wsSummary.getCell(zrow, i + 1);
+      cell.value = v as ExcelJS.CellValue;
+      styleCell(cell, {
+        size: 10, bgColor: bg, fgColor: fg,
+        hAlign: i >= 1 ? 'right' : 'left',
+        numFmt: i === 0 ? undefined : (i === 2 || i === 3 ? '#,##0' : '#,##0.000000'),
+      });
+    });
+    wsSummary.getRow(zrow).height = 20;
+  });
+
+  // Grand total row
+  const gtRow = 4 + blockData.tod_summary.length;
+  const gtVals: (string | number)[] = ['TOTAL', grandTotalConsumption, '', blockData.billing_period.total_blocks, '', '', grandTotalAmount];
+  gtVals.forEach((v, i) => {
+    const cell = wsSummary.getCell(gtRow, i + 1);
+    cell.value = v as ExcelJS.CellValue;
+    styleCell(cell, {
+      bold: true, size: 11, fgColor: C.grandTotalFg, bgColor: C.grandTotalBg,
+      hAlign: i >= 1 ? 'right' : 'left',
+      numFmt: i === 1 ? '#,##0.000' : (i === 3 ? '#,##0' : (i === 6 ? '₹#,##0.00' : undefined)),
+      borderStyle: 'medium',
+    });
+  });
+  wsSummary.getRow(gtRow).height = 26;
+
+  // ── Sheet 2: 15-Min Block Data ───────────────────────────────────────────────
+  const wsBlocks = wb.addWorksheet('15-Min Blocks', {
+    views: [{ state: 'frozen', xSplit: 0, ySplit: 1, showGridLines: false }],
+  });
+
+  wsBlocks.columns = [
+    { width: 13 },  // A – Date
+    { width: 8  },  // B – Time
+    { width: 10 },  // C – Block # (day)
+    { width: 14 },  // D – Global Block #
+    { width: 26 },  // E – TOD Zone
+    { width: 20 },  // F – Consumption (kWh)
+    { width: 16 },  // G – Rate (₹/kWh)
+    { width: 18 },  // H – Amount (₹)
+  ];
+
+  // Column headers (row 1 – frozen)
+  const blockHeaders = ['Date', 'Time', 'Block# (Day)', 'Block# (Global)', 'TOD Zone', 'Consumption (kWh)', 'Rate (₹/kWh)', 'Amount (₹)'];
+  blockHeaders.forEach((h, i) => {
+    const cell = wsBlocks.getCell(1, i + 1);
+    cell.value = h;
+    styleCell(cell, {
+      bold: true, size: 10, fgColor: C.colHeaderFg, bgColor: C.colHeaderBg,
+      hAlign: i >= 5 ? 'right' : (i === 0 || i === 1 ? 'center' : 'left'),
+      borderStyle: 'medium',
+    });
+  });
+  wsBlocks.getRow(1).height = 24;
+
+  // Enable auto-filter on header row
+  wsBlocks.autoFilter = { from: 'A1', to: 'H1' };
+
+  // Data rows
+  blockData.blocks.forEach((blk, idx) => {
+    const rowNum = idx + 2;
+    const { bg } = zoneColors(blk.tod_zone);
+    // Alternate between zone colour and white for readability
+    const rowBg = idx % 2 === 0 ? bg : C.normalRowBg;
+
+    const vals: (string | number)[] = [
+      blk.date,
+      blk.time,
+      blk.block_index,
+      blk.global_block_num,
+      blk.tod_zone,
+      blk.consumption_kwh,
+      blk.rate_per_kwh,
+      blk.amount_rs,
+    ];
+
+    vals.forEach((v, i) => {
+      const cell = wsBlocks.getCell(rowNum, i + 1);
+      cell.value = v as ExcelJS.CellValue;
+      styleCell(cell, {
+        size: 9,
+        bgColor: rowBg,
+        hAlign: i >= 5 ? 'right' : (i <= 1 ? 'center' : 'left'),
+        numFmt: i === 5 ? '#,##0.000000' : (i === 6 ? '#,##0.0000' : (i === 7 ? '#,##0.0000' : undefined)),
+        borderStyle: 'hair',
+      });
+    });
+    wsBlocks.getRow(rowNum).height = 15;
+  });
+
+  // ─── Write & Download ────────────────────────────────────────────────────────
+  const buffer = await wb.xlsx.writeBuffer();
+  const blob   = new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url  = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href  = url;
+  const acct = billData.billing_details?.account_number ?? 'export';
+  const period = blockData.billing_period.start_date.replace(/-/g, '');
+  link.download = `block_data_${acct}_${period}.xlsx`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+

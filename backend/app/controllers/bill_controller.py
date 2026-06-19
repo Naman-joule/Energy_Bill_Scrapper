@@ -175,3 +175,15 @@ class BillController:
         except Exception as e:
             logger.error(f"Calculation failed: {e}")
             raise HTTPException(status_code=400, detail=f"Recalculation failed: {str(e)}")
+
+    @staticmethod
+    def get_block_data(payload: BillData):
+        """Generates 15-minute interval block-wise energy data for the billing period."""
+        try:
+            data_dict = payload.model_dump()
+            result = billing_service.generate_block_data(data_dict)
+            return result
+        except Exception as e:
+            logger.error(f"Block data generation failed: {e}")
+            raise HTTPException(status_code=400, detail=f"Block data generation failed: {str(e)}")
+

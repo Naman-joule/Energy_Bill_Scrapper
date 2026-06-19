@@ -73,3 +73,56 @@ export const calculateBill = async (data: BillData): Promise<{
 
   return response.json();
 };
+
+export interface BlockRecord {
+  date: string;
+  time: string;
+  block_index: number;
+  global_block_num: number;
+  tod_zone: string;
+  consumption_kwh: number;
+  rate_per_kwh: number;
+  amount_rs: number;
+}
+
+export interface TodZoneSummary {
+  zone: string;
+  total_consumption_kwh: number;
+  blocks_per_day: number;
+  total_blocks: number;
+  consumption_per_block: number;
+  rate_per_kwh: number;
+}
+
+export interface BlockDataResponse {
+  success: boolean;
+  billing_period: {
+    start_date: string;
+    end_date: string;
+    total_days: number;
+    total_blocks: number;
+  };
+  tod_summary: TodZoneSummary[];
+  blocks: BlockRecord[];
+}
+
+export const fetchBlockData = async (data: BillData): Promise<BlockDataResponse> => {
+  const response = await fetch('/api/block-data', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(data),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    const message = typeof errorData.detail === 'string'
+      ? errorData.detail
+      : 'Block data generation failed';
+    throw new APIError(message, response.status);
+  }
+
+  return response.json();
+};
+

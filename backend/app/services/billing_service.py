@@ -1,8 +1,230 @@
 import re
 import copy
 import logging
+from datetime import date, timedelta, datetime
 
 logger = logging.getLogger(__name__)
+
+
+# ─── 15-minute block data generator ─────────────────────────────────────────
+#
+# UPPCL / PVVNL Standard HT-2 / HV-2 ToD Schedule (4 zones, 24h coverage):
+#
+#   Zone   | Alias  | Hours (IST)                             | Blocks/day
+#   -------|--------|-----------------------------------------|-----------
+#   TOD-1  | Peak   | 06:00-10:00, 18:00-22:00 (8 h)          | 32
+#   TOD-2  | Normal | 10:00-18:00 (8 h)                       | 32
+#   TOD-3  | Off-Pk | 22:00-24:00, 00:00-06:00 (8 h)          | 32 (Night 1)
+#   TOD-4  | Night  | same as TOD-3 on some tariffs — mapped  | —
+#
+# Some bills use only 2-3 zones; the mapper below handles graceful fallback.
+
+# Each entry: (start_hour, end_hour) — half-open [start, end).
+# 24:00 → next day 00:00 is handled by modulo arithmetic.
+_TOD_ZONE_SCHEDULE: list[tuple[int, int]] = [
+    # slot index 0: 00:00-06:00  → zone TOD-3 / Off-Peak / Night
+    (0, 6),
+    # slot index 1: 06:00-10:00  → zone TOD-1 / Peak
+    (6, 10),
+    # slot index 2: 10:00-18:00  → zone TOD-2 / Normal
+    (10, 18),
+    # slot index 3: 18:00-22:00  → zone TOD-1 / Peak  (same zone as index 1)
+    (18, 22),
+    # slot index 4: 22:00-24:00  → zone TOD-3 / Off-Peak / Night
+    (22, 24),
+]
+
+# Ordered list of (zone_keyword_patterns, zone_alias)
+# We match the zone_name field from the reading tables against these.
+_ZONE_PATTERNS = [
+    (["tod-1", "tod1", "peak"],          "TOD-1 (Peak)"),
+    (["tod-2", "tod2", "normal"],        "TOD-2 (Normal)"),
+    (["tod-3", "tod3", "off", "night"],  "TOD-3 (Off-Peak/Night)"),
+    (["tod-4", "tod4"],                  "TOD-4 (Night)"),
+]
+
+# Slot-index → zone alias (standard 4-zone schedule)
+# TOD-1: slots 1, 3 (06-10, 18-22)
+# TOD-2: slot 2 (10-18)
+# TOD-3: slots 0, 4 (00-06, 22-24)
+_SLOT_TO_ZONE_ALIAS = {
+    0: "TOD-3 (Off-Peak/Night)",
+    1: "TOD-1 (Peak)",
+    2: "TOD-2 (Normal)",
+    3: "TOD-1 (Peak)",
+    4: "TOD-3 (Off-Peak/Night)",
+}
+
+# Blocks per day per zone alias (sum of all slots for that alias)
+_ZONE_BLOCKS_PER_DAY: dict[str, int] = {
+    "TOD-1 (Peak)":          32,   # 8h × 4 blocks/h
+    "TOD-2 (Normal)":        32,   # 8h × 4 blocks/h
+    "TOD-3 (Off-Peak/Night)": 32,  # 8h × 4 blocks/h
+    "TOD-4 (Night)":          0,   # merged into TOD-3 when 3-zone
+}
+
+
+def _match_zone_alias(zone_name: str) -> str:
+    """Map a raw zone_name from the bill to a canonical alias."""
+    n = (zone_name or "").lower().replace(" ", "").replace("-", "")
+    for patterns, alias in _ZONE_PATTERNS:
+        for p in patterns:
+            key = p.replace("-", "").replace(" ", "")
+            if key in n:
+                return alias
+    return "TOD-2 (Normal)"   # safe default
+
+
+def generate_block_data(data: dict) -> dict:
+    """
+    Generate 15-minute interval (block-wise) energy data for the entire
+    billing month from the TOD-zone meter readings embedded in the bill.
+
+    Returns:
+        {
+          "success": True,
+          "billing_period": { "start_date": ..., "end_date": ..., "total_days": ... },
+          "tod_summary": [ { "zone": ..., "total_consumption_kwh": ..., "blocks_per_day": ..., ... } ],
+          "blocks": [ { "date": ..., "time": ..., "block_index": ...,
+                         "tod_zone": ..., "consumption_kwh": ...,
+                         "rate_per_kwh": ..., "amount_rs": ... }, ... ]
+        }
+    """
+    # ── 1. Parse billing period ───────────────────────────────────────────────
+    bd = data.get("billing_details") or {}
+    bp = bd.get("billing_period") or {}
+    start_str = bp.get("start_date")
+    end_str   = bp.get("end_date")
+
+    try:
+        start_dt = date.fromisoformat(start_str)
+    except Exception:
+        start_dt = date.today().replace(day=1)
+    try:
+        end_dt = date.fromisoformat(end_str)
+    except Exception:
+        # Default: last day of the month
+        end_dt = (start_dt.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+    # Billing days = number of calendar days in the period [start, end)
+    total_days = (end_dt - start_dt).days
+    if total_days <= 0:
+        total_days = 30   # fallback
+
+    # ── 2. Extract TOD consumption & rate from reading tables ─────────────────
+    # Primary source: reading_tables (meter readings per zone).
+    zone_consumption: dict[str, float] = {}   # alias → total kWh for period
+    zone_rate:        dict[str, float] = {}   # alias → rate from bill_components
+
+    for table in data.get("reading_tables") or []:
+        for r in table.get("readings") or []:
+            zname = r.get("zone_name") or ""
+            alias = _match_zone_alias(zname)
+            present = _to_number(r.get("present_reading")) or 0.0
+            past    = _to_number(r.get("past_reading")) or 0.0
+            mf      = _to_number(r.get("multiplying_factor")) or 1.0
+            # Prefer pre-computed total_consumption when available
+            total_c = _to_number(r.get("total_consumption"))
+            if total_c is None:
+                total_c = (present - past) * mf
+            # Accumulate (a bill may have 2 reading tables for the same month)
+            zone_consumption[alias] = zone_consumption.get(alias, 0.0) + total_c
+
+    # Fallback: if reading tables are empty, try to infer from bill_components
+    if not zone_consumption:
+        for c in data.get("bill_components") or []:
+            nm = str(c.get("component_name") or "").lower()
+            if "tod" in nm and not _is_subtotal(c.get("sno"), c.get("component_name")):
+                alias = _match_zone_alias(nm)
+                cons  = _to_number(c.get("consumption")) or 0.0
+                zone_consumption[alias] = zone_consumption.get(alias, 0.0) + cons
+
+    # Rates from bill_components (per kWh for each TOD energy line)
+    for c in data.get("bill_components") or []:
+        nm = str(c.get("component_name") or "").lower()
+        if "tod" in nm and not _is_subtotal(c.get("sno"), c.get("component_name")):
+            alias = _match_zone_alias(nm)
+            rate  = _to_number(c.get("rate")) or 0.0
+            if rate > 0 and alias not in zone_rate:
+                zone_rate[alias] = rate
+
+    # ── 3. Handle TOD-4 → merge into TOD-3 if TOD-4 has no blocks schedule ──
+    if "TOD-4 (Night)" in zone_consumption and _ZONE_BLOCKS_PER_DAY.get("TOD-4 (Night)", 0) == 0:
+        zone_consumption["TOD-3 (Off-Peak/Night)"] = (
+            zone_consumption.get("TOD-3 (Off-Peak/Night)", 0.0)
+            + zone_consumption.pop("TOD-4 (Night)", 0.0)
+        )
+        if "TOD-4 (Night)" in zone_rate:
+            zone_rate.setdefault("TOD-3 (Off-Peak/Night)", zone_rate.pop("TOD-4 (Night)"))
+
+    # ── 4. Per-block consumption = zone_total / (blocks_per_day × total_days) ─
+    zone_block_cons: dict[str, float] = {}
+    zone_block_rate: dict[str, float] = {}
+
+    # Build summary for each zone
+    tod_summary = []
+    for alias, total_c in zone_consumption.items():
+        bpd = _ZONE_BLOCKS_PER_DAY.get(alias, 32)
+        total_blocks = bpd * total_days
+        per_block = round(total_c / total_blocks, 6) if total_blocks > 0 else 0.0
+        rate_v = zone_rate.get(alias, 0.0)
+        zone_block_cons[alias] = per_block
+        zone_block_rate[alias] = rate_v
+        tod_summary.append({
+            "zone":                  alias,
+            "total_consumption_kwh": round(total_c, 3),
+            "blocks_per_day":        bpd,
+            "total_blocks":          total_blocks,
+            "consumption_per_block": round(per_block, 6),
+            "rate_per_kwh":          rate_v,
+        })
+
+    # ── 5. Generate 96 blocks × total_days rows ───────────────────────────────
+    blocks = []
+    block_num = 1   # global 1-based index across all days
+
+    for day_offset in range(total_days):
+        current_date = start_dt + timedelta(days=day_offset)
+        date_str = current_date.isoformat()
+
+        for slot_idx, (slot_start_h, slot_end_h) in enumerate(_TOD_ZONE_SCHEDULE):
+            alias = _SLOT_TO_ZONE_ALIAS[slot_idx]
+            per_block = zone_block_cons.get(alias, 0.0)
+            rate_v    = zone_block_rate.get(alias, 0.0)
+
+            # Iterate 15-min intervals within this slot
+            minutes_start = slot_start_h * 60
+            minutes_end   = slot_end_h   * 60
+            for m in range(minutes_start, minutes_end, 15):
+                hh, mm = divmod(m, 60)
+                time_str = f"{hh:02d}:{mm:02d}"
+                # block_index within this day: 1-96
+                day_block_idx = m // 15 + 1
+                amount = round(per_block * rate_v, 4)
+
+                blocks.append({
+                    "date":             date_str,
+                    "time":             time_str,
+                    "block_index":      day_block_idx,
+                    "global_block_num": block_num,
+                    "tod_zone":         alias,
+                    "consumption_kwh":  round(per_block, 6),
+                    "rate_per_kwh":     rate_v,
+                    "amount_rs":        amount,
+                })
+                block_num += 1
+
+    return {
+        "success": True,
+        "billing_period": {
+            "start_date":  start_dt.isoformat(),
+            "end_date":    end_dt.isoformat(),
+            "total_days":  total_days,
+            "total_blocks": total_days * 96,
+        },
+        "tod_summary": tod_summary,
+        "blocks": blocks,
+    }
 
 # Category labels used on these bills, in printed order.
 CAT_ENERGY = "Current Demand and Energy Charges After Open Access"

@@ -21,7 +21,8 @@ import type {
 
 // Services
 import { fetchModels, analyzeBill, APIError } from './services/api';
-import { exportToXLSX } from './services/exportService';
+import { exportToXLSX, exportBlockDataToXLSX } from './services/exportService';
+import { fetchBlockData } from './services/api';
 
 // Formatters
 import { formatCurrency } from './utils/formatters';
@@ -475,6 +476,18 @@ function App() {
     await exportToXLSX(editableData);
   };
 
+  // --- Block Data Export (15-min intervals via backend) ---
+  const handleExportBlockData = async () => {
+    if (!editableData) return;
+    try {
+      const blockData = await fetchBlockData(editableData);
+      await exportBlockDataToXLSX(blockData, editableData);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Block data export failed';
+      alert(`Export failed: ${msg}`);
+    }
+  };
+
 
   const importFromCSV = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -792,6 +805,14 @@ function App() {
                   >
                     <Download size={14} />
                     Export Excel
+                  </button>
+                  <button 
+                    className="tab-btn"
+                    onClick={handleExportBlockData}
+                    style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(14,116,144,0.12)', border: '1px solid rgba(14,116,144,0.3)', color: 'var(--accent-hover)', borderRadius: '4px' }}
+                  >
+                    <Clock size={14} />
+                    Export 15-Min Blocks
                   </button>
                 </div>
 
