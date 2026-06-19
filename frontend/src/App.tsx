@@ -21,6 +21,7 @@ import type {
 
 // Services
 import { fetchModels, analyzeBill, APIError } from './services/api';
+import { exportToXLSX } from './services/exportService';
 
 // Formatters
 import { formatCurrency } from './utils/formatters';
@@ -468,188 +469,12 @@ function App() {
     setShowVerifyModal(false);
   };
 
-  // --- CSV Export & Import ---
-  const exportToCSV = () => {
+  // --- Excel Export ---
+  const handleExportXLSX = async () => {
     if (!editableData) return;
-
-    const rows: string[][] = [];
-    const pushRow = (rowCells: string[]) => {
-      rows.push(rowCells);
-      return rows.length; // Returns the 1-based index of this row
-    };
-
-    pushRow(['Utility Provider', editableData.utility_provider || '']);
-    pushRow([]);
-
-    pushRow(['Customer Details']);
-    pushRow(['Name', editableData.customer_details?.name || '']);
-    pushRow(['Billing Address', editableData.customer_details?.billing_address || '']);
-    pushRow(['Service Address', editableData.customer_details?.service_address || '']);
-    pushRow([]);
-
-    pushRow(['Billing Details']);
-    pushRow(['Account Number', editableData.billing_details?.account_number || '']);
-    pushRow(['Meter Number', editableData.billing_details?.meter_number || '']);
-    pushRow(['Invoice Number', editableData.billing_details?.invoice_number || '']);
-    pushRow(['Bill Date', editableData.billing_details?.bill_date || '']);
-    pushRow(['Due Date', editableData.billing_details?.due_date || '']);
-    pushRow(['Discont Date', editableData.billing_details?.discont_date || '']);
-    pushRow(['Billing Period Start', editableData.billing_details?.billing_period?.start_date || '']);
-    pushRow(['Billing Period End', editableData.billing_details?.billing_period?.end_date || '']);
-    pushRow(['Contracted Demand (KVA)', String(editableData.billing_details?.contracted_demand_kva ?? '')]);
-    pushRow(['Billable Demand (KVA)', String(editableData.billing_details?.billable_demand_kva ?? '')]);
-    pushRow(['Tariff Code', editableData.billing_details?.tariff_code || '']);
-    pushRow(['Supply Voltage', editableData.billing_details?.supply_voltage || '']);
-    pushRow([]);
-
-    if (editableData.reading_tables && editableData.reading_tables.length > 0) {
-      editableData.reading_tables.forEach((table, idx) => {
-        pushRow([`Reading Table ${idx + 1}`, `Period: ${table.reading_from || ''}`]);
-        pushRow(['Zone Name', 'Present Reading', 'Past Reading', 'Difference', 'Multiplying Factor', 'Total Consumption']);
-        if (table.readings) {
-          table.readings.forEach(reading => {
-            const nextRowIdx = rows.length + 1;
-            pushRow([
-              reading.zone_name || '',
-              String(reading.present_reading ?? ''),
-              String(reading.past_reading ?? ''),
-              `=B${nextRowIdx}-C${nextRowIdx}`, // Present - Past
-              String(reading.multiplying_factor ?? ''),
-              `=D${nextRowIdx}*E${nextRowIdx}`  // Difference * MF
-            ]);
-          });
-        }
-        pushRow([]);
-      });
-    }
-
-    pushRow(['Bill Components']);
-    pushRow(['Sno', 'Category', 'Component Name', 'Consumption', 'Rate', 'Unit', 'Amount (Rs.)']);
-    
-    const categoryRows: { [cat: string]: number[] } = {
-      "Current Demand and Energy Charges After Open Access": [],
-      "Additional Charges": [],
-      "Miscellaneous Charges": [],
-      "Arrear and LPS Charges": [],
-      "other": []
-    };
-    
-    let rowSubtotalA = 0;
-    let rowSubtotalB = 0;
-    let rowSubtotalC = 0;
-    let rowSubtotalD = 0;
-    let rowSubtotalE = 0;
-    let rowSubtotalF = 0;
-    let rowFPPA = 0;
-
-    if (editableData.bill_components) {
-      editableData.bill_components.forEach(comp => {
-        const nextRowIdx = rows.length + 1;
-        const sno = (comp.sno || '').toUpperCase().trim();
-        const isSubtotal = ['A', 'B', 'C', 'D', 'E', 'F'].includes(sno);
-        let amountVal = '';
-
-        if (isSubtotal) {
-          if (sno === 'A') {
-            rowSubtotalA = nextRowIdx;
-            const rowsToSum = categoryRows["Current Demand and Energy Charges After Open Access"];
-            amountVal = rowsToSum.length > 0 ? `=${rowsToSum.map(r => `G${r}`).join('+')}` : '0';
-          } else if (sno === 'B') {
-            rowSubtotalB = nextRowIdx;
-            const rowsToSum = categoryRows["Additional Charges"];
-            amountVal = rowsToSum.length > 0 ? `=${rowsToSum.map(r => `G${r}`).join('+')}` : '0';
-          } else if (sno === 'C') {
-            rowSubtotalC = nextRowIdx;
-            amountVal = (rowSubtotalA && rowSubtotalB) ? `=G${rowSubtotalA}+G${rowSubtotalB}` : '0';
-          } else if (sno === 'D') {
-            rowSubtotalD = nextRowIdx;
-            const rowsToSum = categoryRows["Miscellaneous Charges"];
-            amountVal = rowsToSum.length > 0 ? `=${rowsToSum.map(r => `G${r}`).join('+')}` : '0';
-          } else if (sno === 'E') {
-            rowSubtotalE = nextRowIdx;
-            const rowsToSum = categoryRows["Arrear and LPS Charges"];
-            amountVal = rowsToSum.length > 0 ? `=${rowsToSum.map(r => `G${r}`).join('+')}` : '0';
-          } else if (sno === 'F') {
-            rowSubtotalF = nextRowIdx;
-            amountVal = (rowSubtotalC && rowSubtotalD) ? `=G${rowSubtotalC}+G${rowSubtotalD}+G${rowSubtotalE}` : '0';
-          }
-        } else {
-          const cat = comp.category || "Current Demand and Energy Charges After Open Access";
-          if (categoryRows[cat]) {
-            categoryRows[cat].push(nextRowIdx);
-          } else {
-            categoryRows["other"].push(nextRowIdx);
-          }
-
-          const name = (comp.component_name || '').toLowerCase();
-          if (name.includes('fppa') || name.includes('fuel')) {
-            rowFPPA = nextRowIdx;
-          }
-
-          if (comp.consumption !== null && comp.rate !== null && comp.consumption > 0 && comp.rate > 0) {
-            amountVal = `=ROUND(D${nextRowIdx}*E${nextRowIdx},0)`;
-          } else {
-            amountVal = String(comp.amount ?? '');
-          }
-        }
-
-        pushRow([
-          comp.sno || '',
-          comp.category || '',
-          comp.component_name || '',
-          String(comp.consumption ?? ''),
-          String(comp.rate ?? ''),
-          comp.unit || '',
-          amountVal
-        ]);
-      });
-    }
-    pushRow([]);
-
-    pushRow(['Billing Summary']);
-    
-    pushRow(['Total Energy Charges', rowSubtotalA ? `=G${rowSubtotalA}` : String(editableData.billing_summary?.total_energy_charges ?? '')]);
-    pushRow(['Total Additional Charges', rowSubtotalB ? `=G${rowSubtotalB}` : String(editableData.billing_summary?.total_additional_charges ?? '')]);
-    pushRow(['Total Miscellaneous Charges', rowSubtotalD ? `=G${rowSubtotalD}` : String(editableData.billing_summary?.total_miscellaneous_charges ?? '')]);
-    pushRow(['Total Arrears & LPS', rowSubtotalE ? `=G${rowSubtotalE}` : String(editableData.billing_summary?.total_arrears_lps ?? '')]);
-    
-    const netBillSummaryRow = rows.length + 1;
-    pushRow(['Net Bill Amount', rowSubtotalF ? `=G${rowSubtotalF}` : String(editableData.billing_summary?.net_bill_amount ?? '')]);
-    
-    const rebateSummaryRow = rows.length + 1;
-    let rebateFormula = String(editableData.billing_summary?.rebate ?? '');
-    if (rowSubtotalA) {
-      if (rowFPPA) {
-        rebateFormula = `=ROUND((G${rowSubtotalA}+G${rowFPPA})*0.01,0)`;
-      } else {
-        rebateFormula = `=ROUND(G${rowSubtotalA}*0.01,0)`;
-      }
-    }
-    pushRow(['Rebate', rebateFormula]);
-    
-    pushRow(['Payable Till Due Date', `=B${netBillSummaryRow}-B${rebateSummaryRow}`]);
-    pushRow(['Payable After Due Date', `=B${netBillSummaryRow}`]);
-
-    const escapeCell = (cell: string): string => {
-      const s = String(cell);
-      if (s.includes(',') || s.includes('"') || s.includes('\n')) {
-        return `"${s.replace(/"/g, '""')}"`;
-      }
-      return s;
-    };
-
-    const csvContent = rows.map(row => row.map(escapeCell).join(',')).join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    const acctNo = editableData.billing_details?.account_number || 'export';
-    link.download = `energy_bill_${acctNo}_${new Date().toISOString().split('T')[0]}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    await exportToXLSX(editableData);
   };
+
 
   const importFromCSV = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -962,11 +787,11 @@ function App() {
                   </button>
                   <button 
                     className="tab-btn"
-                    onClick={exportToCSV}
-                    style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
+                    onClick={handleExportXLSX}
+                    style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(30,58,95,0.12)', border: '1px solid rgba(30,58,95,0.3)', color: 'var(--accent-hover)', borderRadius: '4px' }}
                   >
                     <Download size={14} />
-                    Export CSV
+                    Export Excel
                   </button>
                 </div>
 
